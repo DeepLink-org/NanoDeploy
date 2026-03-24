@@ -1,0 +1,26 @@
+Diagnostics:
+  UnusedIncludes: None
+
+Index:
+  Background: Build
+
+---
+If:
+  PathMatch: (.*\/)?DLSlime/.*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$
+CompileFlags:
+  CompilationDatabase: DLSlime/build
+
+---
+If:
+  PathMatch: (.*\/)?NanoDeploy/.*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$
+CompileFlags:
+  CompilationDatabase: NanoDeploy/build
+  Add:
+    - -INanoDeploy
+    - -INanoCommon/include
+    - -INanoDeploy/build/nanodeploy/csrc/sequence
+
+---
+CompileFlags:
+  Add:
+    - -std=c++20
