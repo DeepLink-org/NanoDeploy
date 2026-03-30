@@ -5,11 +5,9 @@ import numpy as np
 import ray
 import torch
 import torch.distributed as dist
-import torch.profiler as profiler
 from nanodeploy._cpp import (
     extract_aux_from_bytes,
     extract_vision_slots_from_bytes,
-    parse_migrate_batch,
     prepare_decode_from_bytes,
     prepare_prefill_from_bytes,
     serialize_run_batch,
@@ -68,6 +66,7 @@ class ModelRunner:
         set_runner_config(
             max_num_seqs=config.max_num_seqs,
             dummy_weight=config.dummy_weight,
+            dummy_eplb=config.dummy_eplb,
             enable_eplb=config.enable_eplb,
         )
 
@@ -325,7 +324,8 @@ class ModelRunner:
         recv_buf_size = recv_buf.nelement() * recv_buf.element_size()
         recv_mr = peer_agent.register_memory_region(
             "vision_recv",
-            recv_buf.data_ptr() + int(recv_buf.storage_offset()),
+            recv_buf.data_ptr(),
+            int(recv_buf.storage_offset()),
             recv_buf_size,
         )
 

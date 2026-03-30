@@ -96,7 +96,7 @@ class CacheContext:
             // block_bytes
         )
 
-        logger.info(
+        logger.debug(
             f"Rank{dist.get_rank()} num_local_kvcache_blocks: {self.num_local_kvcache_blocks}"
         )
 
@@ -255,18 +255,19 @@ class CacheContext:
             device=torch.get_default_device(),
         )
 
-        # Recurrent state: [num_layers, num_slots, num_v_heads, head_k_dim, head_v_dim]
+        # Recurrent state: [num_layers, num_slots, num_v_heads, head_v_dim, head_k_dim]
+        # K-last layout to match flashinfer's gated_delta_rule_decode_pretranspose
         self.gdn_recurrent_states = torch.zeros(
             num_layers,
             num_slots,
             num_v_heads,
-            head_k_dim,
             head_v_dim,
+            head_k_dim,
             dtype=torch.float32,
             device=torch.get_default_device(),
         )
 
-        logger.info(
+        logger.debug(
             f"Allocated GDN states: conv={self.gdn_conv_states.shape} "
             f"({self.gdn_conv_states.element_size() * self.gdn_conv_states.nelement() / 1e9:.2f} GB), "
             f"recurrent={self.gdn_recurrent_states.shape} "
@@ -328,7 +329,8 @@ class CacheContext:
             kv_size = self.kv_cache.numel() * self.kv_cache.itemsize
             self._local_mr_handler = self._peer_agent.register_memory_region(
                 _KV_CACHE_BUFFER_ID,
-                self.kv_cache.data_ptr() + int(self.kv_cache.storage_offset()),
+                self.kv_cache.data_ptr(),
+                int(self.kv_cache.storage_offset()),
                 kv_size,
             )
             logger.info(
