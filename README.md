@@ -4,9 +4,6 @@
 
 | Component                      | Language    | Description             | Key Features                                                                                    |
 | ------------------------------ | ----------- | ----------------------- | ----------------------------------------------------------------------------------------------- |
-| [DLSlime](./DLSlime)           | C++         | RDMA communication      | Zero-copy KV cache migration, P2P mesh networking, GPUDirect RDMA                               |
-| [NanoBench](./NanoBench)       | Python      | Benchmarking tools      | Performance testing and profiling                                                               |
-| [NanoCommon](./NanoCommon)     | C++         | Shared utilities        | Logging, common data structures, error handling                                                 |
 | [NanoCtrl](./NanoCtrl)         | Rust        | Control plane           | Redis-backed service registry, health monitoring, engine discovery, Python client               |
 | [NanoDeploy](./NanoDeploy)     | Python/C++  | LLM inference engine    | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
 | [NanoDeployVL](./NanoDeployVL) | Python      | Vision-Language encoder | EP-separated ViT encoder, RDMA embedding transfer, Qwen3-VL support                             |
