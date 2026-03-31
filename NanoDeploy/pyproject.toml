@@ -25,9 +25,9 @@ dependencies = [
     "pyzmq>=25.0",
     "httpx",
     "uvloop>=0.21.0",
-    "dlslime>=0.0.2.post2",
     "ray",
     "transformers>=4.51.0",
+    "dlslime==0.0.3.rc1",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
