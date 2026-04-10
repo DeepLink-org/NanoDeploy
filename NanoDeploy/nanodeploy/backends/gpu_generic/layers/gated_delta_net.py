@@ -17,6 +17,42 @@ from nanodeploy.models.quant_config import QuantizationConfig
 
 logger = get_logger()
 
+try:
+    from nanodeploy.backends.gpu_generic.kernels.rmsnorm_gated import (
+        can_use_rms_norm_gated_kernel,
+        rms_norm_gated_triton,
+    )
+except ImportError:
+    can_use_rms_norm_gated_kernel = None
+    rms_norm_gated_triton = None
+
+try:
+    from nanodeploy.backends.gpu_generic.kernels.repeat_interleave import (
+        can_use_repeat_interleave_from_prefix_triton,
+        repeat_interleave_from_prefix_triton,
+    )
+except ImportError:
+    can_use_repeat_interleave_from_prefix_triton = None
+    repeat_interleave_from_prefix_triton = None
+
+try:
+    from nanodeploy.backends.gpu_generic.kernels.repeat_heads import (
+        can_use_repeat_heads_triton,
+        repeat_heads_triton,
+    )
+except ImportError:
+    can_use_repeat_heads_triton = None
+    repeat_heads_triton = None
+
+try:
+    from nanodeploy.backends.gpu_generic.kernels.ragged_layout import (
+        can_use_ragged_to_padded_triton,
+        ragged_to_padded_triton,
+    )
+except ImportError:
+    can_use_ragged_to_padded_triton = None
+    ragged_to_padded_triton = None
+
 # Try to import flashinfer GDN kernels (preferred, SM90 native)
 try:
     from flashinfer import chunk_gated_delta_rule
@@ -50,13 +86,17 @@ class RMSNormGated(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
 
-    @torch.compile
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: [..., hidden_size] — the value to normalize
             gate: [..., hidden_size] — gating signal (SiLU applied)
         """
+        if can_use_rms_norm_gated_kernel is not None and can_use_rms_norm_gated_kernel(
+            x, gate, self.weight
+        ):
+            return rms_norm_gated_triton(x, gate, self.weight, self.eps)
+
         input_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
@@ -145,6 +185,37 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
 
         # Kernel availability
         self._has_flashinfer = _HAS_FLASHINFER_GDN
+        self._conv1d_prefill_padded_ws: torch.Tensor | None = None
+
+    def _get_conv1d_prefill_padded_workspace(
+        self,
+        num_seqs: int,
+        dim: int,
+        max_seqlen: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        ws = self._conv1d_prefill_padded_ws
+        need_new_ws = (
+            ws is None
+            or ws.device != device
+            or ws.dtype != dtype
+            or ws.shape[0] < num_seqs
+            or ws.shape[1] < dim
+            or ws.shape[2] < max_seqlen
+        )
+        if need_new_ws:
+            self._conv1d_prefill_padded_ws = torch.empty(
+                num_seqs,
+                dim,
+                max_seqlen,
+                device=device,
+                dtype=dtype,
+            )
+
+        padded = self._conv1d_prefill_padded_ws[:num_seqs, :dim, :max_seqlen]
+        padded.zero_()
+        return padded
 
     def forward(
         self,
@@ -156,55 +227,158 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             hidden_states: [total_tokens, hidden_size]
         """
         context = get_context()
+
+        # Lazy verify: 2 tokens/seq processed as two sequential decode passes.
+        # Pass 1 processes token_0 (prev_sampled) and saves intermediate state
+        # to backup slots; pass 2 processes token_1 (draft) writing final
+        # state to active slots.  After verify, rejected seqs can be rolled
+        # back by copying backup → active.
+        if context.num_tokens_per_seq == 2 and not context.is_prefill:
+            return self._lazy_verify_forward(hidden_states, context)
+
         total_tokens = hidden_states.shape[0]
 
         # 1. Input projections (fused QKV)
         qkv = self.in_proj_qkv(hidden_states)
-
         z = self.in_proj_z(hidden_states)
         a = self.in_proj_a(hidden_states)
         b = self.in_proj_b(hidden_states)
 
-        # 2. Causal Conv1d on fused QKV
-        qkv = self._apply_conv1d(qkv, context)
-
-        # 3. Split back to Q, K, V (after conv)
-        q, k, v = qkv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
-
-        # 4. Reshape Q, K, V (contiguous needed for flashinfer kernels)
-        q = q.view(total_tokens, self.num_k_heads, self.head_k_dim).contiguous()
-        k = k.view(total_tokens, self.num_k_heads, self.head_k_dim).contiguous()
-        v = v.view(total_tokens, self.num_v_heads, self.head_v_dim).contiguous()
-
-        # 5. Expand q, k for GVA
-        if self.kv_ratio > 1:
-            q = q.repeat_interleave(self.kv_ratio, dim=1)
-            k = k.repeat_interleave(self.kv_ratio, dim=1)
-
-        # 6. Apply GDN kernel
         scale = self.head_k_dim**-0.5
+
         if context.is_prefill:
+            # 2. Prefill path: chunk conv1d + chunk GDN
+            qkv = self._apply_conv1d(qkv, context)
+            q, k, v = qkv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+            q = q.view(total_tokens, self.num_k_heads, self.head_k_dim).contiguous()
+            k = k.view(total_tokens, self.num_k_heads, self.head_k_dim).contiguous()
+            v = v.view(total_tokens, self.num_v_heads, self.head_v_dim).contiguous()
+            if self.kv_ratio > 1:
+                if (
+                    repeat_heads_triton is not None
+                    and can_use_repeat_heads_triton is not None
+                    and can_use_repeat_heads_triton(q, self.kv_ratio)
+                    and can_use_repeat_heads_triton(k, self.kv_ratio)
+                ):
+                    q = repeat_heads_triton(q, self.kv_ratio)
+                    k = repeat_heads_triton(k, self.kv_ratio)
+                else:
+                    q = q.repeat_interleave(self.kv_ratio, dim=1)
+                    k = k.repeat_interleave(self.kv_ratio, dim=1)
             beta = b.float().sigmoid()
             A_exp = -self.A_log.float().exp()
             g = A_exp * F.softplus(a.float() + self.dt_bias)
             alpha = g.exp()
             core_attn_out = self._gdn_prefill(q, k, v, g, alpha, beta, scale, context)
         else:
-            core_attn_out = self._gdn_decode(q, k, v, a, b, scale, context)
+            # 2. Decode path: single-token conv1d + fused GDN decode
+            core_attn_out = self._decode_one_step(
+                qkv, a, b, total_tokens, scale, context
+            )
 
-        # 7. Apply gated RMSNorm
+        return self._apply_output_transform(core_attn_out, z, total_tokens)
+
+    def _lazy_verify_forward(
+        self,
+        hidden_states: torch.Tensor,
+        context,
+    ) -> torch.Tensor:
+        """Forward for lazy verify (num_tokens_per_seq == 2).
+
+        Processes 2 tokens per sequence using two sequential single-token
+        decode passes.  Between the passes, the intermediate (1-token) state
+        is copied to the backup region of the state pool so that rejected
+        sequences can be rolled back cheaply after verification.
+
+        Args:
+            hidden_states: [bs*2, hidden_size]  interleaved
+                [tok0_seq0, tok1_seq0, tok0_seq1, tok1_seq1, ...]
+        """
+        total_tokens = hidden_states.shape[0]
+        bs = total_tokens // 2
+
+        # ---------- 1. Stateless input projections on ALL tokens ----------
+        qkv_all = self.in_proj_qkv(hidden_states)  # [bs*2, conv_dim]
+        z_all = self.in_proj_z(hidden_states)  # [bs*2, value_dim]
+        a_all = self.in_proj_a(hidden_states)  # [bs*2, num_v_heads]
+        b_all = self.in_proj_b(hidden_states)  # [bs*2, num_v_heads]
+
+        # Split into token_0 (even) and token_1 (odd)
+        qkv_0 = qkv_all[0::2].contiguous()  # [bs, conv_dim]
+        qkv_1 = qkv_all[1::2].contiguous()  # [bs, conv_dim]
+        a_0, a_1 = a_all[0::2].contiguous(), a_all[1::2].contiguous()
+        b_0, b_1 = b_all[0::2].contiguous(), b_all[1::2].contiguous()
+
+        # ---------- 2. Pass 1: decode token_0 (prev_sampled) ----------
+        scale = self.head_k_dim**-0.5
+        o0 = self._decode_one_step(qkv_0, a_0, b_0, bs, scale, context)
+
+        # ---------- 3. Snapshot intermediate state → backup slots ----------
+        gdn_conv_states = context.gdn_conv_states
+        gdn_recurrent_states = context.gdn_recurrent_states
+        gdn_state_slots = context.gdn_state_slots
+        if gdn_conv_states is not None and gdn_state_slots is not None:
+            backup_offset = (gdn_conv_states.shape[1] - 1) // 2
+            active_slots = gdn_state_slots[:bs]
+            # Clamp so that CUDAGraph dummy slots (= 2*max_bs) map to the
+            # dummy slot itself instead of exceeding pool size.
+            max_slot = gdn_conv_states.shape[1] - 1
+            backup_slots = torch.clamp(active_slots + backup_offset, max=max_slot)
+            gdn_conv_states[self.layer_idx, backup_slots] = gdn_conv_states[
+                self.layer_idx, active_slots
+            ]
+            gdn_recurrent_states[self.layer_idx, backup_slots] = gdn_recurrent_states[
+                self.layer_idx, active_slots
+            ]
+
+        # ---------- 4. Pass 2: decode token_1 (draft) ----------
+        o1 = self._decode_one_step(qkv_1, a_1, b_1, bs, scale, context)
+
+        # ---------- 5. Interleave outputs ----------
+        core_out = torch.empty(
+            total_tokens,
+            self.num_v_heads,
+            self.head_v_dim,
+            dtype=o0.dtype,
+            device=o0.device,
+        )
+        core_out[0::2] = o0
+        core_out[1::2] = o1
+
+        # ---------- 6. Gated RMSNorm + output projection ----------
+        return self._apply_output_transform(core_out, z_all, total_tokens)
+
+    def _apply_output_transform(
+        self, core_attn_out: torch.Tensor, z: torch.Tensor, total_tokens: int
+    ) -> torch.Tensor:
+        """Gated RMSNorm + output projection (shared by forward & lazy verify)."""
         z = z.view(total_tokens, self.num_v_heads, self.head_v_dim)
         out = core_attn_out.reshape(-1, self.head_v_dim)
         z_flat = z.reshape(-1, self.head_v_dim)
-
         out = self.norm(out, z_flat)
-
         out = out.view(total_tokens, self.num_v_heads, self.head_v_dim)
-
-        # 8. Output projection
         out = out.reshape(total_tokens, self.value_dim)
-        output = self.out_proj(out)
-        return output
+        return self.out_proj(out)
+
+    def _decode_one_step(
+        self,
+        qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        bs: int,
+        scale: float,
+        context,
+    ) -> torch.Tensor:
+        """Conv1d update + split/reshape + GDN decode for a single token per sequence."""
+        qkv = self._conv1d_decode(qkv, context)
+        q, k, v = qkv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = q.view(bs, self.num_k_heads, self.head_k_dim).contiguous()
+        k = k.view(bs, self.num_k_heads, self.head_k_dim).contiguous()
+        v = v.view(bs, self.num_v_heads, self.head_v_dim).contiguous()
+        if self.kv_ratio > 1:
+            q = q.repeat_interleave(self.kv_ratio, dim=1)
+            k = k.repeat_interleave(self.kv_ratio, dim=1)
+        return self._gdn_decode(q, k, v, a, b, scale, context)
 
     def _apply_conv1d(self, qkv: torch.Tensor, context) -> torch.Tensor:
         """Apply causal conv1d to concatenated QKV.
@@ -240,18 +414,43 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             total_tokens = qkv.shape[0]
             max_seqlen = context.max_seqlen_q
             dim = qkv.shape[1]
-            seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+            cu_seqlens_long = cu_seqlens.to(torch.int64)
+            batch_values = torch.arange(num_seqs, device=qkv.device, dtype=torch.int64)
+            offset_values = cu_seqlens_long[:-1].contiguous()
 
-            batch_idx = torch.repeat_interleave(
-                torch.arange(num_seqs, device=qkv.device, dtype=torch.long),
-                seq_lens,
-                output_size=total_tokens,
-            )
-            offsets = torch.repeat_interleave(
-                cu_seqlens[:-1].long(),
-                seq_lens,
-                output_size=total_tokens,
-            )
+            if (
+                repeat_interleave_from_prefix_triton is not None
+                and can_use_repeat_interleave_from_prefix_triton is not None
+                and can_use_repeat_interleave_from_prefix_triton(
+                    batch_values, cu_seqlens_long
+                )
+            ):
+                batch_idx = repeat_interleave_from_prefix_triton(
+                    batch_values,
+                    cu_seqlens_long,
+                    total_tokens,
+                    max_repeat_hint=max_seqlen,
+                )
+                offsets = repeat_interleave_from_prefix_triton(
+                    offset_values,
+                    cu_seqlens_long,
+                    total_tokens,
+                    max_repeat_hint=max_seqlen,
+                )
+            else:
+                # print("no torch_interleave")
+
+                seq_lens = (cu_seqlens_long[1:] - cu_seqlens_long[:-1]).contiguous()
+                batch_idx = torch.repeat_interleave(
+                    torch.arange(num_seqs, device=qkv.device, dtype=torch.long),
+                    seq_lens,
+                    output_size=total_tokens,
+                )
+                offsets = torch.repeat_interleave(
+                    cu_seqlens_long[:-1],
+                    seq_lens,
+                    output_size=total_tokens,
+                )
             pos_in_seq = (
                 torch.arange(
                     total_tokens,
@@ -261,23 +460,30 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                 - offsets
             )
 
-            padded = torch.zeros(
+            padded = self._get_conv1d_prefill_padded_workspace(
                 num_seqs,
                 dim,
                 max_seqlen,
-                device=qkv.device,
-                dtype=qkv.dtype,
+                qkv.device,
+                qkv.dtype,
             )
-            padded[batch_idx, :, pos_in_seq] = qkv
+            if (
+                ragged_to_padded_triton is not None
+                and can_use_ragged_to_padded_triton is not None
+                and can_use_ragged_to_padded_triton(qkv, cu_seqlens_long, padded)
+            ):
+                ragged_to_padded_triton(qkv, cu_seqlens_long, max_seqlen, out=padded)
+            else:
+                padded[batch_idx, :, pos_in_seq] = qkv
 
             if gdn_state_slots is not None:
                 init_states = gdn_conv_states[
                     self.layer_idx, gdn_state_slots[:num_seqs], :, 1:
-                ].contiguous()
+                ]
             else:
-                init_states = gdn_conv_states[
-                    self.layer_idx, :num_seqs, :, 1:
-                ].contiguous()
+                init_states = gdn_conv_states[self.layer_idx, :num_seqs, :, 1:]
+            if not init_states.is_contiguous():
+                init_states = init_states.contiguous()
 
             padded_out = causal_conv1d_fn(
                 x=padded,
@@ -286,15 +492,31 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                 activation=self.activation,
             )
 
-            qkv_out = torch.empty_like(qkv)
-            qkv_out[:] = padded_out[batch_idx, :, pos_in_seq]
+            qkv_out = padded_out[batch_idx, :, pos_in_seq]
         else:
             # First chunk or single-chunk: batched with seq_idx
-            seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
-            seq_idx = torch.repeat_interleave(
-                torch.arange(num_seqs, dtype=torch.int32, device=qkv.device),
-                seq_lens,
-            ).unsqueeze(0)
+            cu_seqlens_long = cu_seqlens.to(torch.int64)
+            seq_values = torch.arange(num_seqs, dtype=torch.int32, device=qkv.device)
+            if (
+                repeat_interleave_from_prefix_triton is not None
+                and can_use_repeat_interleave_from_prefix_triton is not None
+                and can_use_repeat_interleave_from_prefix_triton(
+                    seq_values, cu_seqlens_long
+                )
+            ):
+
+                seq_idx = repeat_interleave_from_prefix_triton(
+                    seq_values,
+                    cu_seqlens_long,
+                    qkv.shape[0],
+                    max_repeat_hint=context.max_seqlen_q,
+                ).unsqueeze(0)
+            else:
+                seq_lens = (cu_seqlens_long[1:] - cu_seqlens_long[:-1]).contiguous()
+                seq_idx = torch.repeat_interleave(
+                    torch.arange(num_seqs, dtype=torch.int32, device=qkv.device),
+                    seq_lens,
+                ).unsqueeze(0)
 
             qkv_out = (
                 causal_conv1d_fn(
@@ -313,11 +535,14 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             states = causal_conv1d_varlen_states(
                 qkv, cu_seqlens, self.conv_kernel_size - 1
             )
-            padded = torch.cat([torch.zeros_like(states[:, :, :1]), states], dim=-1)
             if gdn_state_slots is not None:
-                gdn_conv_states[self.layer_idx, gdn_state_slots[:num_seqs]] = padded
+                target_states = gdn_conv_states[
+                    self.layer_idx, gdn_state_slots[:num_seqs]
+                ]
             else:
-                gdn_conv_states[self.layer_idx, :num_seqs] = padded
+                target_states = gdn_conv_states[self.layer_idx, :num_seqs]
+            target_states.zero_()
+            target_states[:, :, 1:].copy_(states)
 
         return qkv_out
 
