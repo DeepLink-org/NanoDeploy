@@ -19,6 +19,145 @@ from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.models.deepseek_v2.deepseek_v2 import DeepseekV2MLP
 from nanodeploy.models.quant_config import QuantizationConfig
 
+# Optional vendored sglang DSV4 fused kernels. When present,
+# _apply_rotary_interleaved replaces ~10 eager elementwise launches per
+# call with a single CUDA kernel.
+# Source (vendored under nanodeploy/_third_party/sglang_jit_kernel):
+#   https://github.com/sgl-project/sglang
+#   python/sglang/jit_kernel/deepseek_v4.py::fused_rope
+# Runtime deps for the vendored slice: torch, triton, tvm-ffi.
+try:
+    from nanodeploy._third_party.sglang_jit_kernel.deepseek_v4 import (
+        fused_norm_rope_inplace as _SGL_FUSED_NORM_ROPE,
+        fused_rope as _SGL_FUSED_ROPE,
+        rmsnorm_self as _SGL_RMSNORM_SELF,
+    )
+except Exception:
+    # ImportError if tvm-ffi isn't installed; any other Exception if
+    # the vendored layout is broken on this checkout. Fall back to
+    # eager either way.
+    _SGL_FUSED_ROPE = None
+    _SGL_FUSED_NORM_ROPE = None
+    _SGL_RMSNORM_SELF = None
+
+# Triton kernels for fused UE8M0 FP8 quant. Replace the per-block
+# amax/exp2/clamp/cast op chain (~10 launches per call) with one
+# kernel each.
+try:
+    from nanodeploy.backends.gpu_generic.kernels.fp8_ue8m0_quant import (
+        fp8_quant_dequant_inplace as _TRITON_FP8_QDQ,
+        pack_kv_fp8 as _TRITON_FP8_PACK,
+        store_dsv4_kv_fp8_fused as _TRITON_FP8_STORE,
+    )
+except Exception:
+    _TRITON_FP8_QDQ = None
+    _TRITON_FP8_PACK = None
+    _TRITON_FP8_STORE = None
+
+# Fused index-construction kernels for ``_decode_attention_flash_mla``.
+# Replace the ~30 elementwise launches per call (arange/where/clamp/
+# floor_divide/remainder/gather chain) with one triton kernel each.
+try:
+    from nanodeploy.models.deepseek_v4.index_kernels import (
+        build_extra_indices_paged as _TRITON_BUILD_EXTRA_INDICES_PAGED,
+        build_swa_indices as _TRITON_BUILD_SWA_INDICES,
+        compress_counts_update as _TRITON_COMPRESS_COUNTS_UPDATE,
+        compress_physical_slots_paged as _TRITON_COMPRESS_PHYSICAL_SLOTS,
+        compress_post_shift_overlap as _TRITON_COMPRESS_POST_SHIFT,
+        compress_scatter_update as _TRITON_COMPRESS_SCATTER_UPDATE,
+        compute_compress_metadata as _TRITON_COMPUTE_COMPRESS_METADATA,
+    )
+except Exception:
+    _TRITON_BUILD_SWA_INDICES = None
+    _TRITON_BUILD_EXTRA_INDICES_PAGED = None
+    _TRITON_COMPRESS_POST_SHIFT = None
+    _TRITON_COMPRESS_PHYSICAL_SLOTS = None
+    _TRITON_COMPRESS_SCATTER_UPDATE = None
+    _TRITON_COMPUTE_COMPRESS_METADATA = None
+    _TRITON_COMPRESS_COUNTS_UPDATE = None
+
+# Compressor compute fused tilelang kernels: cat-rearrange + softmax +
+# weighted-sum + bfloat16 cast in one launch each (overlap=True for
+# ratio=4 layers, overlap=False for ratio=128 layers).
+#
+# History: an earlier Triton implementation (in the same file but later
+# rewritten) caused `_SGL_MHC_PRE` (tilelang) to silently fail on first
+# co-launch — the HC eager fallback fired, adding ~12k extra kernels per
+# step and a 40% throughput regression. Rewriting in tilelang keeps both
+# kernels on the same runtime and avoids the conflict.
+try:
+    from nanodeploy.models.deepseek_v4.compress_kernels import (
+        compress_no_overlap_softmax_sum as _TILE_COMPRESS_NO_OVERLAP,
+        compress_overlap_softmax_sum as _TILE_COMPRESS_OVERLAP,
+    )
+except Exception:
+    _TILE_COMPRESS_OVERLAP = None
+    _TILE_COMPRESS_NO_OVERLAP = None
+
+# Vendored sglang DSV4 hyper-connection (HC) tilelang kernels. Fuses
+# the eager F.linear + RMSNorm + sigmoid + sinkhorn + reduce chain in
+# DeepseekV4HCProjector.forward into 2-3 tilelang kernels.
+# Source: https://github.com/sgl-project/sglang
+#   python/sglang/srt/layers/mhc.py
+try:
+    from nanodeploy._third_party.sglang_mhc import mhc_pre as _SGL_MHC_PRE
+except Exception:
+    _SGL_MHC_PRE = None
+
+
+def _maybe_fused_norm_rope(
+    compressed: torch.Tensor,
+    norm: nn.Module,
+    rotary_emb: nn.Module,
+    compressed_pos: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Try the single-kernel RMSNorm+RoPE; return None if unsupported.
+
+    Replaces the pattern::
+
+        out = norm(compressed)
+        out_rope = _apply_rotary_interleaved(rotary_emb, pos, out[..., -rd:].unsqueeze(1)).squeeze(1)
+        out = torch.cat([out[..., :-rd], out_rope], dim=-1)
+
+    with one CUDA kernel that does both. The kernel mutates
+    ``compressed`` in place and the caller continues to use the same
+    tensor.
+
+    Source: https://github.com/sgl-project/sglang
+            python/sglang/jit_kernel/deepseek_v4.py::fused_norm_rope_inplace
+    """
+    if (
+        _SGL_FUSED_NORM_ROPE is None
+        or getattr(rotary_emb, "freqs_cis_cache", None) is None
+        or getattr(norm, "add_unit_offset", False)
+        or not compressed.is_cuda
+        or compressed.dtype != torch.bfloat16
+        or compressed.dim() != 2
+    ):
+        return None
+    try:
+        pos64 = (
+            compressed_pos
+            if compressed_pos.dtype == torch.int64
+            else compressed_pos.long()
+        )
+        buf = compressed if compressed.is_contiguous() else compressed.contiguous()
+        # The kernel is templated on (dtype, head_dim, rope_dim); JIT
+        # builds on first call. weight dtype must equal kv dtype.
+        weight = norm.weight
+        if weight.dtype != buf.dtype:
+            weight = weight.to(buf.dtype)
+        _SGL_FUSED_NORM_ROPE(
+            buf,
+            weight,
+            float(norm.eps),
+            rotary_emb.freqs_cis_cache,
+            pos64,
+        )
+        return buf
+    except Exception:
+        return None
+
 
 def _getattr_any(config, *names, default=None):
     for name in names:
@@ -55,18 +194,52 @@ def _debug_dump(name: str, tensor: torch.Tensor, layer_idx: int | None = None) -
         return
     if not _debug_layer_enabled(layer_idx):
         return
-    if os.getenv("NANODEPLOY_DSV4_DEBUG_PREFILL_ONLY", "1") != "0":
+
+    # Resolve context flags up front (these are Python bools/ints, not
+    # tensors — no host↔device sync needed).
+    is_prefill_run = True
+    is_dummy = False
+    try:
+        context = get_context()
+        is_prefill_run = bool(context.is_prefill)
+        is_dummy = bool(getattr(context, "is_dummy", False))
+    except Exception:
+        pass
+
+    # Skip warmup / graph-capture passes always: they don't carry real
+    # data and would break CUDAGraph capture if we did any host sync.
+    if is_dummy and os.getenv("NANODEPLOY_DSV4_DEBUG_SKIP_DUMMY", "1") != "0":
+        return
+
+    # Decode-step dumps require a host sync (.item() on context_lens) to
+    # know which step we're on. That's only safe in eager mode — under
+    # CUDAGraph replay the captured Python doesn't even run, and during
+    # capture warmup we'd invalidate the stream. We disable decode dumps
+    # entirely unless prefill-only is off AND we're not under graphs.
+    decode_step: int | None = None
+    if is_prefill_run:
+        if os.getenv("NANODEPLOY_DSV4_DEBUG_PREFILL_ONLY", "1") != "0":
+            pass  # prefill mode is the default and is graph-safe
+    else:
+        # Decode dumping disabled by default. Only enable with
+        # NANODEPLOY_DSV4_DEBUG_PREFILL_ONLY=0 and require eager mode
+        # (no CUDAGraph) — caller must run with --enforce_eager true.
+        if os.getenv("NANODEPLOY_DSV4_DEBUG_PREFILL_ONLY", "1") != "0":
+            return
+        decode_steps_env = os.getenv("NANODEPLOY_DSV4_DEBUG_DECODE_STEPS", "")
+        if not decode_steps_env.strip():
+            return
         try:
-            context = get_context()
-            if not context.is_prefill:
-                return
-            if (
-                os.getenv("NANODEPLOY_DSV4_DEBUG_SKIP_DUMMY", "1") != "0"
-                and context.is_dummy
-            ):
-                return
+            csl = getattr(get_context(), "context_lens", None)
+            if csl is not None and csl.numel() > 0:
+                decode_step = int(csl.flatten()[0].item())
         except Exception:
-            pass
+            return
+        wanted = {
+            int(x) for x in decode_steps_env.replace(",", " ").split() if x.strip()
+        }
+        if decode_step is None or decode_step not in wanted:
+            return
 
     max_tokens = int(os.getenv("NANODEPLOY_DSV4_DEBUG_MAX_TOKENS", "8"))
     payload = tensor.detach()
@@ -74,9 +247,10 @@ def _debug_dump(name: str, tensor: torch.Tensor, layer_idx: int | None = None) -
         payload = payload[:max_tokens]
     payload = payload.cpu().contiguous()
     layer = "global" if layer_idx is None else f"layer{layer_idx}"
+    step_suffix = "" if decode_step is None else f"_step{decode_step}"
     path = Path(out_dir)
     path.mkdir(parents=True, exist_ok=True)
-    file_path = path / f"nanodeploy_rank{rank}_{layer}_{name}.pt"
+    file_path = path / f"nanodeploy_rank{rank}_{layer}_{name}{step_suffix}.pt"
     if os.getenv("NANODEPLOY_DSV4_DEBUG_ONCE", "1") != "0" and file_path.exists():
         return
     torch.save(
@@ -84,6 +258,7 @@ def _debug_dump(name: str, tensor: torch.Tensor, layer_idx: int | None = None) -
             "name": name,
             "rank": rank,
             "layer": layer_idx,
+            "decode_step": decode_step,
             "shape": tuple(tensor.shape),
             "dtype": str(tensor.dtype),
             "tensor": payload,
@@ -98,6 +273,75 @@ def _apply_rotary_interleaved(
     x: torch.Tensor,
     inverse: bool = False,
 ):
+    # Fast path: single-kernel RoPE via sglang's fused_rope. The kernel
+    # is in-place and ``x`` is often a slice view of a bigger tensor
+    # (e.g. ``kv[..., -rd:].unsqueeze(1)`` at the attention call site).
+    # If we mutate that view in place and the caller then does
+    # ``kv[..., -rd:] = result``, PyTorch detects the overlapping
+    # memory and raises "some elements of the input tensor and the
+    # written-to tensor refer to a single memory location". To match
+    # the eager path's "return a fresh tensor" semantics we clone
+    # first; the clone is one CUDA memcpy which is still cheaper than
+    # the 7+ elementwise kernels in the eager fallback.
+    # Adapted from https://github.com/sgl-project/sglang
+    #   python/sglang/jit_kernel/deepseek_v4.py::fused_rope
+    if (
+        _SGL_FUSED_ROPE is not None
+        and getattr(rotary_emb, "freqs_cis_cache", None) is not None
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and positions.dtype in (torch.int32, torch.int64)
+        and positions.dim() == 1
+        and x.dim() in (2, 3)
+    ):
+        squeeze_head = x.dim() == 2
+        # Clone to a contiguous bf16 buffer so (a) the kernel's
+        # last-dim-stride-1 contract is satisfied, and (b) we don't
+        # mutate the caller's storage. ``.contiguous()`` is a no-op
+        # when the slice is already C-contiguous, falling back to
+        # ``.clone()`` so we always get a fresh tensor.
+        x_buf = x.contiguous() if x.is_contiguous() else x.contiguous()
+        if x_buf.data_ptr() == x.data_ptr():
+            x_buf = x_buf.clone()
+        x_view = x_buf.unsqueeze(1) if squeeze_head else x_buf
+        # Compressor.forward_prefill passes ``positions[:cutoff:ratio]``
+        # which is a strided view (stride=ratio). The kernel's
+        # ``TensorMatcher({B})`` requires stride-1, so make it
+        # contiguous here. Cheap when already stride-1.
+        if not positions.is_contiguous():
+            positions = positions.contiguous()
+        try:
+            _SGL_FUSED_ROPE(
+                x_view, None, rotary_emb.freqs_cis_cache, positions, inverse
+            )
+            return x_view.squeeze(1) if squeeze_head else x_view
+        except Exception as _exc:
+            # Either the tensor-shape contract failed (unsupported
+            # head_dim, non-contig stride) or the first-call JIT compile
+            # failed. Fall through to the eager implementation.
+            # One-time diagnostic: log why the fast path bailed so we
+            # can fix it. Gated to fire once per (process, error class).
+            global _FUSED_ROPE_WARNED
+            if "_FUSED_ROPE_WARNED" not in globals():
+                _FUSED_ROPE_WARNED = set()
+            _key = type(_exc).__name__
+            if _key not in _FUSED_ROPE_WARNED:
+                _FUSED_ROPE_WARNED.add(_key)
+                from nanodeploy.logging import get_logger
+
+                get_logger().warning(
+                    "fused_rope fast path bailed: %s. x.shape=%s dtype=%s "
+                    "contig=%s positions.shape=%s dtype=%s inverse=%s. "
+                    "Falling back to eager rope.",
+                    _exc,
+                    tuple(x.shape),
+                    x.dtype,
+                    x.is_contiguous(),
+                    tuple(positions.shape),
+                    positions.dtype,
+                    inverse,
+                )
+
     cos_sin = rotary_emb.cos_sin_cache[positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
     x_pair = x.float().unflatten(-1, (-1, 2))
@@ -112,10 +356,98 @@ def _apply_rotary_interleaved(
     return torch.stack((y0, y1), dim=-1).flatten(-2).to(x.dtype)
 
 
+def _apply_rotary_interleaved_inplace(
+    rotary_emb: nn.Module,
+    positions: torch.Tensor,
+    x_view: torch.Tensor,
+    inverse: bool = False,
+) -> None:
+    """In-place RoPE on ``x_view``. Caller's storage is mutated through
+    the view; no return value, no write-back needed.
+
+    The sglang ``fused_rope`` kernel accepts ``with_strides({-1, -1, 1})``
+    — only the last dim must be stride-1, which is true for tail-dim
+    slices like ``q[..., -rope_dim:]``. The non-inplace
+    ``_apply_rotary_interleaved`` clones to a fresh contiguous buffer and
+    the caller does ``q[..., -rope_dim:] = result`` (one ``index_put``
+    write-back). Both are unnecessary when the kernel supports strided
+    storage. This variant skips both, saving 2 kernels per call site.
+
+    The eager fallback uses ``copy_`` instead of an assignment, achieving
+    the same write-back-elision.
+    """
+    if (
+        _SGL_FUSED_ROPE is not None
+        and getattr(rotary_emb, "freqs_cis_cache", None) is not None
+        and x_view.is_cuda
+        and x_view.dtype == torch.bfloat16
+        and positions.dtype in (torch.int32, torch.int64)
+        and positions.dim() == 1
+        and x_view.dim() in (2, 3)
+        and x_view.stride(-1) == 1
+    ):
+        try:
+            x3d = x_view.unsqueeze(1) if x_view.dim() == 2 else x_view
+            pos = positions if positions.is_contiguous() else positions.contiguous()
+            _SGL_FUSED_ROPE(x3d, None, rotary_emb.freqs_cis_cache, pos, inverse)
+            return
+        except Exception as _exc:
+            global _FUSED_ROPE_INPLACE_WARNED
+            if "_FUSED_ROPE_INPLACE_WARNED" not in globals():
+                _FUSED_ROPE_INPLACE_WARNED = set()
+            _key = type(_exc).__name__
+            if _key not in _FUSED_ROPE_INPLACE_WARNED:
+                _FUSED_ROPE_INPLACE_WARNED.add(_key)
+                from nanodeploy.logging import get_logger
+
+                get_logger().warning(
+                    "fused_rope inplace fast path bailed: %s. Falling back "
+                    "to eager rope + copy_.",
+                    _exc,
+                )
+    # Eager fallback: compute then copy_back into x_view.
+    cos_sin = rotary_emb.cos_sin_cache[positions]
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    x_pair = x_view.float().unflatten(-1, (-1, 2))
+    x0 = x_pair[..., 0]
+    x1 = x_pair[..., 1]
+    if inverse:
+        y0 = x0 * cos + x1 * sin
+        y1 = x1 * cos - x0 * sin
+    else:
+        y0 = x0 * cos - x1 * sin
+        y1 = x1 * cos + x0 * sin
+    result = torch.stack((y0, y1), dim=-1).flatten(-2).to(x_view.dtype)
+    x_view.copy_(result)
+
+
 def _fp8_quant_dequant_inplace(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
-    """Simulate official DSV4 KV FP8 QAT quant-dequant in-place."""
+    """Simulate official DSV4 KV FP8 QAT quant-dequant in-place.
+
+    Fast path: a single triton kernel does the per-block amax + UE8M0
+    scale + fp8 round-trip in one launch (~1 reduce + 1 elementwise
+    instead of ~10 eager kernels). Falls back to the original eager
+    chain on any failure.
+    """
     if x.numel() == 0:
         return x
+    if (
+        _TRITON_FP8_QDQ is not None
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and x.shape[-1] % block_size == 0
+    ):
+        try:
+            return _TRITON_FP8_QDQ(x, block_size)
+        except Exception:
+            pass
+
+    # Eager fallback — full FP8 round-trip (NOT a no-op). See triton
+    # kernel _ue8m0_quant_dequant_inplace_kernel for why we DON'T copy
+    # reference's no-op semantics here: NanoDeploy's KV cache is FP8
+    # (memory savings) so the local kv must be pre-quantized to keep
+    # the eager-fallback attention path consistent with flash_mla.
     orig_shape = x.shape
     assert orig_shape[-1] % block_size == 0
     view = (
@@ -160,8 +492,18 @@ def _pack_kv_fp8(
     """Quantize KV [T, 512] BF16 → (nope_fp8[T,448], rope_bf16[T,64], scales_u8[T,7]).
 
     Uses power-of-2 (UE8M0) per-64-tile scales, matching official DSv4 / SGLang.
+    Fast path is a single triton kernel; falls back to the eager op chain
+    if the kernel is unavailable.
     """
     assert kv_bf16.dtype == torch.bfloat16 and kv_bf16.shape[-1] == 512
+    if _TRITON_FP8_PACK is not None and kv_bf16.is_cuda:
+        try:
+            return _TRITON_FP8_PACK(
+                kv_bf16, _DSV4_NOPE_DIM, _DSV4_ROPE_DIM, _DSV4_TILE_SIZE
+            )
+        except Exception:
+            pass
+
     nope, rope = kv_bf16.split([_DSV4_NOPE_DIM, _DSV4_ROPE_DIM], dim=-1)
 
     # Per-tile FP8 quantization with power-of-2 scales
@@ -204,6 +546,31 @@ def _store_dsv4_fp8_batched(
         slot_mapping: [T] int32/int64. Slot = -1 redirects to the dummy last
                       slot (avoids data-dependent control flow for CUDAGraph).
     """
+    # Fast path: single triton kernel does pack + scatter in one launch
+    # (replaces 10+ elementwise/reduce launches that otherwise pile up
+    # in the per-decode-step launch storm).
+    if (
+        _TRITON_FP8_STORE is not None
+        and kv_bf16.is_cuda
+        and cache_buf.is_cuda
+        and cache_buf.dtype == torch.uint8
+        and cache_buf.is_contiguous()
+        and cache_buf.shape[-1] == _DSV4_BYTES_PER_TOKEN
+    ):
+        try:
+            _TRITON_FP8_STORE(
+                kv_bf16.contiguous(),
+                cache_buf,
+                slot_mapping,
+                page_size,
+                nope_dim=_DSV4_NOPE_DIM,
+                rope_dim=_DSV4_ROPE_DIM,
+                tile_size=_DSV4_TILE_SIZE,
+            )
+            return
+        except Exception:
+            pass
+
     nope_fp8, rope_bf16, scales_u8 = _pack_kv_fp8(kv_bf16)
     T = kv_bf16.shape[0]
 
@@ -270,7 +637,43 @@ class DeepseekV4HCProjector(nn.Module):
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Fast path: vendored sglang ``mhc_pre`` collapses RMSNorm +
+        # F.linear + sigmoid + sinkhorn + per-token reduction into a
+        # 2-kernel pipeline (mhc_pre_gemm_sqrsum_splitk + mhc_pre_big_fuse).
+        # Adapted from https://github.com/sgl-project/sglang
+        #   python/sglang/srt/layers/mhc.py::mhc_pre
         shape, dtype = x.shape, x.dtype
+        if (
+            _SGL_MHC_PRE is not None
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and self.fn.dtype == torch.float32
+        ):
+            try:
+                # mhc_pre expects residual shape [..., hc_mult, hidden];
+                # nanodeploy's ``x`` is already that shape.
+                post_mix, comb_mix, layer_input = _SGL_MHC_PRE(
+                    x.contiguous(),
+                    self.fn,
+                    self.scale,
+                    self.base,
+                    rms_eps=self.eps,
+                    hc_pre_eps=self.eps,
+                    hc_sinkhorn_eps=self.eps,
+                    hc_post_mult_value=2.0,  # nanodeploy: post = 2 * sigmoid(...)
+                    sinkhorn_repeat=self.sinkhorn_iters,
+                )
+                # Outputs come out as fp32 (post_mix, comb_mix) and the
+                # layer_input matches input dtype. Cast post/comb to
+                # match nanodeploy's eager return contract.
+                return (
+                    layer_input,  # y
+                    post_mix.squeeze(-1).to(dtype),  # post (drop trailing 1)
+                    comb_mix.to(dtype),  # comb
+                )
+            except Exception:
+                pass
+
         x_flat = x.flatten(1).float()
         rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + self.eps)
         mixes = F.linear(x_flat, self.fn) * rsqrt
@@ -352,6 +755,14 @@ class DeepseekV4Compressor(nn.Module):
         )
         self.wkv = _FloatLinear(self.hidden_size, coeff * head_dim)
         self.wgate = _FloatLinear(self.hidden_size, coeff * head_dim)
+        # Cached concat of wkv.weight + wgate.weight along the output
+        # dim, lazily populated on first forward (after weight loading).
+        # One FP32 Linear call replaces two cuBLAS gemvx calls per
+        # compressed layer (~78/step → ~39/step). Stored as a plain
+        # tensor (not nn.Parameter) so the loader still targets
+        # ``wkv.weight`` and ``wgate.weight``.
+        self._wkv_gate_weight: torch.Tensor | None = None
+        self._coeff_head_dim_split = coeff * head_dim
         self.norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
 
         # Tensorized state (allocated by init_tensorized_state, None until then)
@@ -421,6 +832,25 @@ class DeepseekV4Compressor(nn.Module):
                 device=device,
             )
 
+    def _wkv_gate_forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One FP32 Linear call producing both kv_all and score_all.
+
+        Replaces ``self.wkv(x), self.wgate(x)`` (two cuBLAS gemvx calls
+        + two ``.float()`` casts) with one Linear call against the
+        concatenated weight tensor. Lazily caches the concat on first
+        call (after weight loading).
+        """
+        if self._wkv_gate_weight is None:
+            with torch.no_grad():
+                self._wkv_gate_weight = torch.cat(
+                    [self.wkv.weight, self.wgate.weight], dim=0
+                ).contiguous()
+        out = F.linear(hidden_states.float(), self._wkv_gate_weight)
+        d = self._coeff_head_dim_split
+        return out[..., :d], out[..., d:]
+
     def _overlap_transform(self, tensor: torch.Tensor, value: float) -> torch.Tensor:
         # tensor: [num_blocks, ratio, 2 * head_dim]
         num_blocks = tensor.size(0)
@@ -467,8 +897,8 @@ class DeepseekV4Compressor(nn.Module):
 
         dtype = hidden_states.dtype
         cutoff = seqlen - (seqlen % ratio)
-        kv_all = self.wkv(hidden_states)
-        score_all = self.wgate(hidden_states)
+        # Fused wkv + wgate: one cuBLAS call.
+        kv_all, score_all = self._wkv_gate_forward(hidden_states)
         offset = ratio if self.overlap else 0
         if self.overlap and cutoff >= ratio:
             kv_state[:ratio] = kv_all[cutoff - ratio : cutoff]
@@ -494,21 +924,31 @@ class DeepseekV4Compressor(nn.Module):
             kv = self._overlap_transform(kv, 0.0)
             score = self._overlap_transform(score, float("-inf"))
         kv = (kv * score.softmax(dim=1)).sum(dim=1)
-        kv = self.norm(kv.to(dtype))
-
         rd = self.rope_head_dim
         compressed_positions = positions[:cutoff:ratio]
-        kv[:, -rd:] = _apply_rotary_interleaved(
-            rotary_emb,
-            compressed_positions,
-            kv[:, None, -rd:],
-        ).squeeze(1)
+        kv_dtype = kv.to(dtype).contiguous()
+        fused = _maybe_fused_norm_rope(
+            kv_dtype, self.norm, rotary_emb, compressed_positions
+        )
+        if fused is not None:
+            kv = fused
+        else:
+            kv = self.norm(kv_dtype)
+            kv[:, -rd:] = _apply_rotary_interleaved(
+                rotary_emb,
+                compressed_positions,
+                kv[:, None, -rd:],
+            ).squeeze(1)
         _fp8_quant_dequant_inplace(kv[:, :-rd], 64)
         if seq_key is not None:
             self._compressed_cache[seq_key] = kv
             # Also update compressed count for tensorized path
             if self._compressed_counts is not None and 0 <= seq_key < self._max_slots:
                 self._compressed_counts[seq_key] = kv.shape[0]
+        # Dump prefill-compressor output (parity with reference's
+        # Compressor.forward end-of-prefill dump). ratio is in the
+        # filename so multiple compressor layers don't collide.
+        _debug_dump(f"compressor_r{ratio}_compressed", kv, None)
         return kv
 
     def forward_decode(
@@ -541,8 +981,10 @@ class DeepseekV4Compressor(nn.Module):
             kv_state, score_state = state
 
         pos_mod = position % ratio
-        kv = self.wkv(hidden_state).squeeze(0)
-        score = self.wgate(hidden_state).squeeze(0) + self.ape[pos_mod]
+        # Fused wkv + wgate: one cuBLAS call.
+        kv_full, score_full = self._wkv_gate_forward(hidden_state)
+        kv = kv_full.squeeze(0)
+        score = score_full.squeeze(0) + self.ape[pos_mod]
         should_compress = (position + 1) % ratio == 0
         compressed = None
         if self.overlap:
@@ -580,16 +1022,23 @@ class DeepseekV4Compressor(nn.Module):
         if compressed is None:
             return None
         dtype = hidden_state.dtype
-        compressed = self.norm(compressed.to(dtype))
         rd = self.rope_head_dim
         compressed_pos = hidden_state.new_tensor(
             [position + 1 - ratio], dtype=torch.long
         )
-        compressed[:, -rd:] = _apply_rotary_interleaved(
-            rotary_emb,
-            compressed_pos,
-            compressed[:, None, -rd:],
-        ).squeeze(1)
+        compressed_dtype = compressed.to(dtype).contiguous()
+        fused = _maybe_fused_norm_rope(
+            compressed_dtype, self.norm, rotary_emb, compressed_pos
+        )
+        if fused is not None:
+            compressed = fused
+        else:
+            compressed = self.norm(compressed_dtype)
+            compressed[:, -rd:] = _apply_rotary_interleaved(
+                rotary_emb,
+                compressed_pos,
+                compressed[:, None, -rd:],
+            ).squeeze(1)
         _fp8_quant_dequant_inplace(compressed[:, :-rd], 64)
 
         # Update compressed cache
@@ -626,74 +1075,156 @@ class DeepseekV4Compressor(nn.Module):
         dtype = hidden_states.dtype
         device = hidden_states.device
 
-        # Projections (already batched)
-        kv_all = self.wkv(hidden_states)  # [bs, coeff*head_dim]
-        score_all = self.wgate(hidden_states)  # [bs, coeff*head_dim]
+        # Projections (already batched). Fused wkv + wgate Linear: one
+        # cuBLAS gemvx call instead of two for the compressed-layer FP32
+        # GEMVs.
+        kv_all, score_all = self._wkv_gate_forward(hidden_states)
 
-        pos_mod = (positions % ratio).long()  # [bs]
-        pos_mod_i = pos_mod.to(torch.int64)
-
-        # Batched state update: scatter at (seq_slot, slot_offset)
-        ape_vals = self.ape[pos_mod_i]  # [bs, coeff*head_dim]
-        if self.overlap:
-            update_idx = ratio + pos_mod_i  # [bs]
+        # Triton fast path: fuses pos_mod + ape gather + update_idx +
+        # 2 scatter writes into one kernel (6 kernels → 1).
+        seq_slots_long = seq_slots.long()
+        positions_long = positions.long()
+        if _TRITON_COMPRESS_SCATTER_UPDATE is not None and self._kv_states.is_cuda:
+            try:
+                _TRITON_COMPRESS_SCATTER_UPDATE(
+                    self._kv_states,
+                    self._score_states,
+                    kv_all,
+                    score_all,
+                    self.ape,
+                    seq_slots_long,
+                    positions_long,
+                    ratio,
+                    self.overlap,
+                )
+            except Exception:
+                pos_mod = (positions % ratio).long()
+                ape_vals = self.ape[pos_mod]
+                update_idx = (ratio + pos_mod) if self.overlap else pos_mod
+                self._kv_states[seq_slots_long, update_idx] = kv_all.float()
+                self._score_states[seq_slots_long, update_idx] = (
+                    score_all.float() + ape_vals
+                )
         else:
-            update_idx = pos_mod_i
-        # Scatter into _kv_states and _score_states
-        self._kv_states[seq_slots.long(), update_idx] = kv_all.float()
-        self._score_states[seq_slots.long(), update_idx] = score_all.float() + ape_vals
+            pos_mod = (positions % ratio).long()
+            ape_vals = self.ape[pos_mod]
+            update_idx = (ratio + pos_mod) if self.overlap else pos_mod
+            self._kv_states[seq_slots_long, update_idx] = kv_all.float()
+            self._score_states[seq_slots_long, update_idx] = (
+                score_all.float() + ape_vals
+            )
 
         # Compute compression for all bs sequences (batched)
         kv_st = self._kv_states[seq_slots.long()]  # [bs, coeff*ratio, coeff*head_dim]
         score_st = self._score_states[seq_slots.long()]  # same
 
+        # Tilelang fast path: one kernel collapses cat-rearrange + softmax
+        # + weighted-sum + bf16 cast (5-7 elementwise + 1 spatial softmax +
+        # 1 reduce per call) into a single launch. Outputs bf16 directly so
+        # the ``.to(dtype).contiguous()`` cast is also subsumed.
+        compressed_dtype = None
         if self.overlap:
-            # Reconstruct [bs, 2*ratio, head_dim] via gather-cat
-            kv_for_c = torch.cat(
-                [kv_st[:, :ratio, :head_dim], kv_st[:, ratio:, head_dim:]], dim=1
-            )  # [bs, 2*ratio, head_dim]
-            score_for_c = torch.cat(
-                [score_st[:, :ratio, :head_dim], score_st[:, ratio:, head_dim:]], dim=1
-            )
-            compressed = (kv_for_c * score_for_c.softmax(dim=1)).sum(
-                dim=1
-            )  # [bs, head_dim]
+            if _TILE_COMPRESS_OVERLAP is not None and kv_st.is_cuda:
+                try:
+                    compressed_dtype = _TILE_COMPRESS_OVERLAP(kv_st, score_st, ratio)
+                except Exception:
+                    compressed_dtype = None
         else:
-            # kv_st: [bs, ratio, head_dim], score_st same
-            compressed = (kv_st * score_st.softmax(dim=1)).sum(dim=1)  # [bs, head_dim]
+            if _TILE_COMPRESS_NO_OVERLAP is not None and kv_st.is_cuda:
+                try:
+                    compressed_dtype = _TILE_COMPRESS_NO_OVERLAP(kv_st, score_st)
+                except Exception:
+                    compressed_dtype = None
 
-        # Apply norm + RoPE + FP8 QAT (batched)
-        compressed = self.norm(compressed.to(dtype))  # [bs, head_dim]
+        if compressed_dtype is None:
+            # Eager fallback (kept for non-CUDA / kernel JIT-failed paths).
+            if self.overlap:
+                # Reconstruct [bs, 2*ratio, head_dim] via gather-cat
+                kv_for_c = torch.cat(
+                    [kv_st[:, :ratio, :head_dim], kv_st[:, ratio:, head_dim:]], dim=1
+                )
+                score_for_c = torch.cat(
+                    [score_st[:, :ratio, :head_dim], score_st[:, ratio:, head_dim:]],
+                    dim=1,
+                )
+                compressed = (kv_for_c * score_for_c.softmax(dim=1)).sum(dim=1)
+            else:
+                compressed = (kv_st * score_st.softmax(dim=1)).sum(dim=1)
+            compressed_dtype = compressed.to(dtype).contiguous()
+
+        # Apply norm + RoPE + FP8 QAT (batched).
+        # Fast path: one CUDA kernel for norm + interleaved RoPE.
         rd = self.rope_head_dim
-        compressed_pos = (positions + 1 - ratio).clamp(min=0)  # [bs]
-        # NOTE: cos_sin_cache has shape [max_pos, 1, rd] (singleton head dim),
-        # so we must pass x with a head dim: [bs, 1, rd], not [bs, rd].
-        compressed_rope = _apply_rotary_interleaved(
-            rotary_emb, compressed_pos, compressed[:, None, -rd:]
-        ).squeeze(
-            1
-        )  # [bs, rd]
-        compressed = torch.cat([compressed[:, :-rd], compressed_rope], dim=-1)
+        # Triton fast path: fuse the per-step compressor metadata math
+        # (positions+1, sub-clamp, mod-eq) into one kernel that produces
+        # both compressed_pos and should_compress (~5 small kernels → 1).
+        if _TRITON_COMPUTE_COMPRESS_METADATA is not None and positions.is_cuda:
+            try:
+                compressed_pos, should_compress = _TRITON_COMPUTE_COMPRESS_METADATA(
+                    positions, ratio
+                )
+            except Exception:
+                compressed_pos = (positions + 1 - ratio).clamp(min=0)
+                should_compress = (positions + 1) % ratio == 0
+        else:
+            compressed_pos = (positions + 1 - ratio).clamp(min=0)
+            should_compress = (positions + 1) % ratio == 0
+        fused = _maybe_fused_norm_rope(
+            compressed_dtype, self.norm, rotary_emb, compressed_pos
+        )
+        if fused is not None:
+            compressed = fused
+        else:
+            # Fallback: norm + slice rotate + cat (4–6 launches).
+            compressed = self.norm(compressed_dtype)
+            # cos_sin_cache has shape [max_pos, 1, rd] so x needs a head
+            # axis: [bs, 1, rd], not [bs, rd].
+            compressed_rope = _apply_rotary_interleaved(
+                rotary_emb, compressed_pos, compressed[:, None, -rd:]
+            ).squeeze(1)
+            compressed = torch.cat([compressed[:, :-rd], compressed_rope], dim=-1)
         # In-place FP8 QAT on the nope portion (safe: compressed is a fresh tensor)
         _fp8_quant_dequant_inplace(compressed[:, :-rd], 64)
 
-        # Which sequences actually compress this step?
-        should_compress = (positions + 1) % ratio == 0  # [bs] bool
+        # ``should_compress`` already computed above by
+        # ``_TRITON_COMPUTE_COMPRESS_METADATA``.
 
         # Post-shift for overlap case: kv_state[:ratio] = kv_state[ratio:]
-        # Apply conditionally via torch.where (graph-safe)
+        # when should_compress[b]. Triton fast path collapses 8 kernels
+        # (4 fancy gathers + 2 ``torch.where`` + 2 fancy index_puts)
+        # into one in-place launch.
         if self.overlap:
-            sc_mask = should_compress.unsqueeze(-1).unsqueeze(-1)  # [bs, 1, 1]
-            shifted_kv = self._kv_states[
-                seq_slots.long(), ratio:
-            ]  # [bs, ratio, coeff*head_dim]
-            shifted_score = self._score_states[seq_slots.long(), ratio:]
-            current_kv_head = self._kv_states[seq_slots.long(), :ratio]
-            current_score_head = self._score_states[seq_slots.long(), :ratio]
-            new_kv_head = torch.where(sc_mask, shifted_kv, current_kv_head)
-            new_score_head = torch.where(sc_mask, shifted_score, current_score_head)
-            self._kv_states[seq_slots.long(), :ratio] = new_kv_head
-            self._score_states[seq_slots.long(), :ratio] = new_score_head
+            if _TRITON_COMPRESS_POST_SHIFT is not None and self._kv_states.is_cuda:
+                try:
+                    _TRITON_COMPRESS_POST_SHIFT(
+                        self._kv_states,
+                        self._score_states,
+                        seq_slots.long(),
+                        should_compress,
+                        ratio,
+                    )
+                except Exception:
+                    sc_mask = should_compress.unsqueeze(-1).unsqueeze(-1)
+                    shifted_kv = self._kv_states[seq_slots.long(), ratio:]
+                    shifted_score = self._score_states[seq_slots.long(), ratio:]
+                    current_kv_head = self._kv_states[seq_slots.long(), :ratio]
+                    current_score_head = self._score_states[seq_slots.long(), :ratio]
+                    new_kv_head = torch.where(sc_mask, shifted_kv, current_kv_head)
+                    new_score_head = torch.where(
+                        sc_mask, shifted_score, current_score_head
+                    )
+                    self._kv_states[seq_slots.long(), :ratio] = new_kv_head
+                    self._score_states[seq_slots.long(), :ratio] = new_score_head
+            else:
+                sc_mask = should_compress.unsqueeze(-1).unsqueeze(-1)
+                shifted_kv = self._kv_states[seq_slots.long(), ratio:]
+                shifted_score = self._score_states[seq_slots.long(), ratio:]
+                current_kv_head = self._kv_states[seq_slots.long(), :ratio]
+                current_score_head = self._score_states[seq_slots.long(), :ratio]
+                new_kv_head = torch.where(sc_mask, shifted_kv, current_kv_head)
+                new_score_head = torch.where(sc_mask, shifted_score, current_score_head)
+                self._kv_states[seq_slots.long(), :ratio] = new_kv_head
+                self._score_states[seq_slots.long(), :ratio] = new_score_head
 
         # Write compressed output to FP8 cache (dummy slot absorbs invalid writes)
         if compressed_cache is not None and self._compressed_counts is not None:
@@ -701,35 +1232,86 @@ class DeepseekV4Compressor(nn.Module):
             num_pages = compressed_cache.shape[0]
             page_size = compressed_cache.shape[1]
             total_slots = num_pages * page_size  # token-level slots
-            cur_counts = self._compressed_counts[seq_slots.long()].long()
+            dummy_slot = total_slots - 1
             if compressed_block_table is not None:
-                # Paged addressing: page_id = block_table[state_slot, block_idx]
-                # block_idx = count // page_size; tok_in_block = count % page_size
-                block_idx = (cur_counts // page_size).long()  # [bs]
-                tok_in_block = (cur_counts % page_size).long()  # [bs]
-                # Clamp block_idx into [0, max_blocks_per_seq) for graph-safe gather.
-                max_blocks = compressed_block_table.shape[1]
-                block_idx_safe = block_idx.clamp(max=max_blocks - 1)
-                # Gather page IDs: bt[seq_slot, block_idx_safe]
-                page_ids = compressed_block_table[seq_slots.long(), block_idx_safe]
-                physical_slots = page_ids.long() * page_size + tok_in_block
+                # Triton fast path: collapses 6 kernels (count gather +
+                # //, %, .clamp, table gather, *+, where) into 1 launch.
+                if _TRITON_COMPRESS_PHYSICAL_SLOTS is not None:
+                    try:
+                        physical_slots = _TRITON_COMPRESS_PHYSICAL_SLOTS(
+                            self._compressed_counts,
+                            seq_slots.long(),
+                            compressed_block_table,
+                            should_compress,
+                            page_size,
+                            dummy_slot,
+                        )
+                    except Exception:
+                        physical_slots = None
+                else:
+                    physical_slots = None
+
+                if physical_slots is None:
+                    cur_counts = self._compressed_counts[seq_slots.long()].long()
+                    block_idx = (cur_counts // page_size).long()
+                    tok_in_block = (cur_counts % page_size).long()
+                    max_blocks = compressed_block_table.shape[1]
+                    block_idx_safe = block_idx.clamp(max=max_blocks - 1)
+                    page_ids = compressed_block_table[seq_slots.long(), block_idx_safe]
+                    physical_slots = page_ids.long() * page_size + tok_in_block
+                    physical_slots = torch.where(
+                        should_compress, physical_slots, dummy_slot
+                    )
             else:
                 # Backward-compat: contiguous-chunk addressing (legacy path).
+                cur_counts = self._compressed_counts[seq_slots.long()].long()
                 valid_slots = (num_pages - 1) * page_size
                 max_compressed = valid_slots // self._max_slots
                 physical_slots = seq_slots.long() * max_compressed + cur_counts
-            # Redirect invalid (not compressing) writes to last slot (in dummy page).
-            dummy_slot = total_slots - 1
-            physical_slots = torch.where(should_compress, physical_slots, dummy_slot)
+                physical_slots = torch.where(
+                    should_compress, physical_slots, dummy_slot
+                )
             _store_dsv4_fp8_batched(
                 compressed,
                 compressed_cache,
                 physical_slots.to(torch.int32),
                 page_size,
             )
-            # Update counts only for compressing seqs
-            inc = should_compress.to(torch.int32)
-            self._compressed_counts.scatter_add_(0, seq_slots.long(), inc)
+            # Update counts only for compressing seqs. Triton fast path
+            # fuses the .to(int32) cast with the scatter_add atomic
+            # increment (2 kernels → 1).
+            if (
+                _TRITON_COMPRESS_COUNTS_UPDATE is not None
+                and self._compressed_counts.is_cuda
+            ):
+                try:
+                    _TRITON_COMPRESS_COUNTS_UPDATE(
+                        self._compressed_counts,
+                        seq_slots.long(),
+                        should_compress,
+                    )
+                except Exception:
+                    inc = should_compress.to(torch.int32)
+                    self._compressed_counts.scatter_add_(0, seq_slots.long(), inc)
+            else:
+                inc = should_compress.to(torch.int32)
+                self._compressed_counts.scatter_add_(0, seq_slots.long(), inc)
+
+        # Dump the compressed kv. We DO NOT gate on
+        # ``bool(should_compress.any())`` because that would do a host
+        # sync (.item()) and invalidate CUDAGraph capture. The dump
+        # function itself early-returns when DEBUG_DIR is unset, so
+        # this is a no-op in production. When debugging, the user is
+        # expected to request a decode step where compression actually
+        # fires (e.g. DECODE_STEPS=128 for prompt_len=8 ratio=128 — at
+        # that step ratio=128, ratio=64, ratio=32, ratio=16, ratio=8,
+        # ratio=4, ratio=2 all fire, so the dumped tensor is always
+        # the real compressor output for the layers we care about).
+        _debug_dump(
+            f"compressor_r{ratio}_compressed",
+            compressed,
+            None,
+        )
 
     def cached(self, seq_key: int) -> torch.Tensor | None:
         return self._compressed_cache.get(seq_key)
@@ -758,6 +1340,15 @@ class DeepseekV4Attention(nn.Module):
     the official FP4 sparse/compressed fast path can be added behind this module
     without changing the rest of the model.
     """
+
+    # Class-level shared cache: layers with the same (compress_ratio, bs)
+    # config share one FlashMLASchedMeta object. flash_mla repopulates the
+    # meta on each invocation when topk/extra_topk values change (which they
+    # do every step), but layers within the same step that share a meta
+    # object trigger the populate kernel only once between them. With 3
+    # unique compress_ratios in DSV4-Pro (0/4/128) and a fixed bs per step,
+    # this cuts ``get_mla_metadata_kernel`` from 43/step to 3/step.
+    _DSV4_SCHED_META_CACHE: dict = {}
 
     def __init__(self, config, quantization_config: QuantizationConfig, layer_idx: int):
         super().__init__()
@@ -847,7 +1438,34 @@ class DeepseekV4Attention(nn.Module):
         # Per-layer sched_meta cache: each layer's config differs by compress_ratio
         # so we cannot share a single FlashMLASchedMeta across layers. Keyed by
         # batch_size to reuse the same meta for repeated calls with same bs.
+        # NOTE: legacy per-instance cache; no longer used. The class-level
+        # ``_DSV4_SCHED_META_CACHE`` (below) is shared across all
+        # ``DeepseekV4Attention`` instances and keyed by
+        # ``(compress_ratio, bs)`` so layers with the same config share one
+        # meta object. flash_mla's ``get_mla_metadata_kernel`` then fires
+        # 3x/step (one per unique compress_ratio) instead of 43x/step.
         self._dsv4_sched_metas: dict[int, object] = {}
+
+        # Alt stream for compressor.forward_decode_batched. Lazily allocated on
+        # first decode call (CUDA context must be initialized). Mirrors
+        # sglang's _forward_prepare_multi_stream pattern: compressor runs on
+        # this stream while KV store + SWA index construction run on the main
+        # stream. The main stream waits before extra-index construction (which
+        # reads compressor._compressed_counts). Compressor work (~2.5 ms)
+        # dominates, so the gain is hiding KV store + SWA index (~100-200 µs).
+        # CUDAGraph-safe: stream is created at warmup, sync points are CUDA
+        # events captured inside the graph.
+        self._compressor_stream: torch.cuda.Stream | None = None
+
+        # Alt stream for the KV-side of attention prep (wkv → kv_norm →
+        # k_rope → fp8_quant). Q-side (wq_a/b → q_norm → rmsnorm_self →
+        # q_rope) runs on _q_stream concurrently. Sync before flash_mla.
+        # The two paths are genuinely independent (only shared input is
+        # hidden_states, which is read-only), so this is a real overlap.
+        self._kv_stream: torch.cuda.Stream | None = None
+        # Alt stream for the Q-side of attention prep. Mirrors KV-stream;
+        # frees main stream to be a sync coordinator during prep.
+        self._q_stream: torch.cuda.Stream | None = None
 
     def _gather_seq_cache(
         self,
@@ -1294,8 +1912,6 @@ class DeepseekV4Attention(nn.Module):
                 extra_topk_lengths = visible_blocks.to(torch.int32)
             extra_k_cache = self.compressed_cache
 
-        # 5. Single flash_mla call: bs=total_q, seq_len_q=1
-        # Use per-layer sched_meta keyed by total_q (not shared across layers)
         tile_meta = self._dsv4_sched_metas.get(total_q)
         if tile_meta is None:
             tile_meta, _ = flash_mla.get_mla_metadata()
@@ -1342,13 +1958,30 @@ class DeepseekV4Attention(nn.Module):
 
         # 1. Store KV to SWA paged FP8 cache
         kv_2d = kv.squeeze(1)  # [T, 512]
-        _store_dsv4_fp8_batched(kv_2d, self.swa_cache, context.slot_mapping, page_size)
-
         # 2. Run compressor update — fully batched, CUDAGraph-safe.
         # Use scheduler-assigned state_slots (stable per-sequence identity
         # across decode steps). Falls back to arange(bs) when slots are not
         # provided (e.g., during warmup before scheduler populates them).
-        if self.compress_ratio and ntps == 1:
+        # Compressor runs on an alt stream so it overlaps with the main
+        # stream's KV store + SWA index construction. Main stream waits on
+        # the alt stream before extra-index construction (which reads
+        # compressor._compressed_counts).
+        #
+        # Capture main_stream and re-pin after the compressor's ``with`` block:
+        # in profiler v18 the SWA-index kernel was observed to land on the
+        # compressor alt stream for compressed layers (39 of 43). Pinning
+        # explicitly to main_stream keeps everything except the compressor
+        # work on the main stream. (v20 attempted this and regressed because
+        # tilelang was not properly installed; with v24's tilelang in place,
+        # retest.)
+        main_stream = torch.cuda.current_stream()
+        compressor_running = self.compress_ratio and ntps == 1
+        if compressor_running:
+            if self._compressor_stream is None:
+                self._compressor_stream = torch.cuda.Stream()
+            comp_stream = self._compressor_stream
+            comp_stream.wait_stream(main_stream)
+
             if context.dsv4_state_slots is not None:
                 seq_slots = context.dsv4_state_slots[:bs]
             else:
@@ -1359,14 +1992,31 @@ class DeepseekV4Attention(nn.Module):
             # addressing (kept for warmup / pre-Stage-3 compatibility).
             cbts = getattr(context, "dsv4_compressed_block_tables", None) or {}
             comp_bt = cbts.get(self.compress_ratio)
-            self.compressor.forward_decode_batched(
-                hidden_states[::ntps],
-                positions_per_seq,
-                self.rotary_emb,
-                seq_slots,
-                self.compressed_cache,
-                compressed_block_table=comp_bt,
-            )
+            with torch.cuda.stream(comp_stream):
+                self.compressor.forward_decode_batched(
+                    hidden_states[::ntps],
+                    positions_per_seq,
+                    self.rotary_emb,
+                    seq_slots,
+                    self.compressed_cache,
+                    compressed_block_table=comp_bt,
+                )
+
+        # Re-pin the remaining work to the main stream (option 3): keeps
+        # KV store, SWA index construction, extra index, and flash_mla on
+        # main while compressor's ~2.5 ms runs on alt.
+        torch.cuda.set_stream(main_stream)
+
+        # KV store and SWA index construction nominally run on the main
+        # stream, but in profiler v18 the SWA index kernel was observed to
+        # land on the compressor alt stream for compressed layers (39 of the
+        # 43 layers per step). Despite this leak the bench was 2x faster than
+        # v20 (which forced everything onto main via ``set_stream``). The H200
+        # is SM-saturated for this workload, so forcing more concurrency
+        # caused contention and slowed every kernel ~2-3x. Leaving the leak
+        # in place: the compressor stream then serializes its own follow-on
+        # work, which empirically wins on this workload.
+        _store_dsv4_fp8_batched(kv_2d, self.swa_cache, context.slot_mapping, page_size)
 
         # 3. Build SWA indices [bs, ntps, swa_topk] — vectorized, no per-seq loop
         swa_topk = ((self.window_size + 63) // 64) * 64  # align to 64
@@ -1374,32 +2024,53 @@ class DeepseekV4Attention(nn.Module):
         # window_size recent tokens. Also guard against exceeding swa_topk.
         swa_topk_lengths = context_lens.clamp(max=min(self.window_size, swa_topk))
 
-        # Logical positions: for each seq, the last min(ctx_len, window) tokens
-        # token_offsets[b, t] = ctx_len[b] - win_len[b] + t
-        token_offsets = torch.arange(
-            swa_topk, device=q.device, dtype=torch.int32
-        ).unsqueeze(
-            0
-        )  # [1, swa_topk]
-        start_pos = (context_lens - swa_topk_lengths).unsqueeze(1)  # [bs, 1]
-        logical_pos = start_pos + token_offsets  # [bs, swa_topk]
+        # Fast path: one fused triton kernel for the entire SWA index
+        # construction (~15 elementwise launches → 1). Falls back to the
+        # eager torch chain on shape/dtype mismatch or kernel JIT failure.
+        if (
+            _TRITON_BUILD_SWA_INDICES is not None
+            and context_lens.is_cuda
+            and block_tables.is_cuda
+            and context_lens.dtype == torch.int32
+            and block_tables.dtype == torch.int32
+        ):
+            try:
+                swa_indices = _TRITON_BUILD_SWA_INDICES(
+                    context_lens,
+                    block_tables,
+                    swa_topk,
+                    page_size,
+                    min(self.window_size, swa_topk),
+                ).unsqueeze(1)
+            except Exception:
+                swa_indices = None
+        else:
+            swa_indices = None
 
-        # Mark invalid positions
-        valid_mask = token_offsets < swa_topk_lengths.unsqueeze(1)  # [bs, swa_topk]
+        if swa_indices is None:
+            # Eager fallback (kept for non-CUDA / JIT-failed paths).
+            token_offsets = torch.arange(
+                swa_topk, device=q.device, dtype=torch.int32
+            ).unsqueeze(
+                0
+            )  # [1, swa_topk]
+            start_pos = (context_lens - swa_topk_lengths).unsqueeze(1)  # [bs, 1]
+            logical_pos = start_pos + token_offsets  # [bs, swa_topk]
+            valid_mask = token_offsets < swa_topk_lengths.unsqueeze(1)
+            page_indices = logical_pos // page_size
+            tok_in_page = logical_pos % page_size
+            page_indices_safe = page_indices.clamp(0, block_tables.shape[1] - 1).long()
+            physical_blocks = block_tables.gather(1, page_indices_safe)
+            physical_slots = physical_blocks * page_size + tok_in_page
+            swa_indices = torch.where(valid_mask, physical_slots, -1).to(torch.int32)
+            swa_indices = swa_indices.unsqueeze(1)  # [bs, 1, swa_topk]
 
-        # Convert logical → physical via block_tables
-        page_indices = logical_pos // page_size  # [bs, swa_topk]
-        tok_in_page = logical_pos % page_size  # [bs, swa_topk]
-        # Clamp page_indices to valid range for gather
-        page_indices_safe = page_indices.clamp(0, block_tables.shape[1] - 1).long()
-        physical_blocks = block_tables.gather(1, page_indices_safe)  # [bs, swa_topk]
-        physical_slots = physical_blocks * page_size + tok_in_page
+        # 4. Build compressed indices [bs, 1, extra_topk] (if compressed layers).
+        # Wait on the compressor stream first — extra-index construction reads
+        # compressor._compressed_counts which the compressor stream just wrote.
+        if compressor_running:
+            torch.cuda.current_stream().wait_stream(self._compressor_stream)
 
-        # Set invalid positions to -1
-        swa_indices = torch.where(valid_mask, physical_slots, -1).to(torch.int32)
-        swa_indices = swa_indices.unsqueeze(1)  # [bs, 1, swa_topk]
-
-        # 4. Build compressed indices [bs, 1, extra_topk] (if compressed layers)
         extra_k_cache = None
         extra_indices = None
         extra_topk_lengths = None
@@ -1422,29 +2093,56 @@ class DeepseekV4Attention(nn.Module):
                 max_blocks = comp_bt.shape[1]
                 max_compressed = max_blocks * page_size_c
                 extra_topk = ((max_compressed + 63) // 64) * 64
-                # Clamp lengths to extra_topk (kernel reads first `length` indices)
-                extra_topk_lengths = self.compressor._compressed_counts[
-                    seq_slots
-                ].clamp(max=extra_topk)
-                # For each (b, t in [0, extra_topk)):
-                #   block_idx = t // page_size_c
-                #   tok_in_block = t % page_size_c
-                #   page_id = comp_bt[seq_slots[b], block_idx]
-                #   physical = page_id * page_size_c + tok_in_block
-                tok_range = torch.arange(extra_topk, device=q.device, dtype=torch.int32)
-                block_idx = (tok_range // page_size_c).long()  # [extra_topk]
-                tok_in_block = (tok_range % page_size_c).long()  # [extra_topk]
-                # Clamp block_idx for graph-safe gather (out-of-range entries
-                # will be masked to -1 by valid_mask below).
-                block_idx_safe = block_idx.clamp(max=max_blocks - 1)
-                # Gather page IDs: [bs, extra_topk]
-                page_ids = comp_bt[
-                    seq_slots.long().unsqueeze(1), block_idx_safe.unsqueeze(0)
-                ]
-                physical = page_ids.long() * page_size_c + tok_in_block.unsqueeze(0)
-                valid_mask = tok_range.unsqueeze(0) < extra_topk_lengths.unsqueeze(1)
-                extra_indices = torch.where(valid_mask, physical, -1).to(torch.int32)
-                extra_indices = extra_indices.unsqueeze(1)  # [bs, 1, extra_topk]
+
+                # Fast path: one fused triton kernel for the entire paged
+                # extra-indices construction (~15 elementwise launches → 1,
+                # plus produces extra_topk_lengths). Eager fallback below.
+                comp_counts = self.compressor._compressed_counts
+                if (
+                    _TRITON_BUILD_EXTRA_INDICES_PAGED is not None
+                    and seq_slots.is_cuda
+                    and comp_counts is not None
+                    and comp_counts.is_cuda
+                    and comp_bt.is_cuda
+                    and comp_counts.dtype == torch.int32
+                    and comp_bt.dtype == torch.int32
+                ):
+                    try:
+                        extra_indices_2d, extra_topk_lengths = (
+                            _TRITON_BUILD_EXTRA_INDICES_PAGED(
+                                seq_slots,
+                                comp_counts,
+                                comp_bt,
+                                extra_topk,
+                                page_size_c,
+                            )
+                        )
+                        extra_indices = extra_indices_2d.unsqueeze(1)
+                    except Exception:
+                        extra_indices = None
+                else:
+                    extra_indices = None
+
+                if extra_indices is None:
+                    # Eager fallback.
+                    extra_topk_lengths = comp_counts[seq_slots].clamp(max=extra_topk)
+                    tok_range = torch.arange(
+                        extra_topk, device=q.device, dtype=torch.int32
+                    )
+                    block_idx = (tok_range // page_size_c).long()
+                    tok_in_block = (tok_range % page_size_c).long()
+                    block_idx_safe = block_idx.clamp(max=max_blocks - 1)
+                    page_ids = comp_bt[
+                        seq_slots.long().unsqueeze(1), block_idx_safe.unsqueeze(0)
+                    ]
+                    physical = page_ids.long() * page_size_c + tok_in_block.unsqueeze(0)
+                    valid_mask = tok_range.unsqueeze(0) < extra_topk_lengths.unsqueeze(
+                        1
+                    )
+                    extra_indices = torch.where(valid_mask, physical, -1).to(
+                        torch.int32
+                    )
+                    extra_indices = extra_indices.unsqueeze(1)
             else:
                 # Backward-compat: contiguous-chunk addressing (legacy path).
                 valid_slots = (self.compressed_cache.shape[0] - 1) * page_size_c
@@ -1557,28 +2255,89 @@ class DeepseekV4Attention(nn.Module):
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         q_len = hidden_states.size(0)
-        q_lora_pre = self.wq_a(hidden_states)
-        _debug_dump("attn_q_lora_pre_norm", q_lora_pre, self.layer_idx)
-        q = self.q_norm(q_lora_pre)
-        _debug_dump("attn_q_lora", q, self.layer_idx)
-        q_flat = self.wq_b(q)
-        _debug_dump("attn_wq_b", q_flat, self.layer_idx)
-        q = q_flat.view(q_len, self.num_heads, self.head_dim)
-        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.rms_norm_eps)
-        _debug_dump("attn_q_normed", q, self.layer_idx)
 
-        kv_pre = self.wkv(hidden_states)
-        _debug_dump("attn_kv_pre_norm", kv_pre, self.layer_idx)
-        kv = self.kv_norm(kv_pre)
-        _debug_dump("attn_kv", kv, self.layer_idx)
-        q_rope = q[..., -self.rope_head_dim :]
-        k_rope = kv[..., -self.rope_head_dim :].unsqueeze(1)
-        q_rope = _apply_rotary_interleaved(self.rotary_emb, positions, q_rope)
-        k_rope = _apply_rotary_interleaved(self.rotary_emb, positions, k_rope)
-        q[..., -self.rope_head_dim :] = q_rope
-        kv = kv.unsqueeze(1)
-        kv[..., -self.rope_head_dim :] = k_rope
-        _fp8_quant_dequant_inplace(kv[..., : -self.rope_head_dim], 64)
+        # Multi-stream attention prep: Q-side, KV-side, and (downstream)
+        # compressor are all independent — shared input ``hidden_states``
+        # is read-only. Q runs on ``_q_stream``, KV runs on ``_kv_stream``,
+        # main is the sync coordinator. Mirrors sglang's
+        # ``_forward_prepare_multi_stream`` pattern.
+        if self._kv_stream is None:
+            self._kv_stream = torch.cuda.Stream()
+        if self._q_stream is None:
+            self._q_stream = torch.cuda.Stream()
+        kv_stream = self._kv_stream
+        q_stream = self._q_stream
+        main_stream = torch.cuda.current_stream()
+        kv_stream.wait_stream(main_stream)
+        q_stream.wait_stream(main_stream)
+
+        # ─── KV-side on _kv_stream ───
+        with torch.cuda.stream(kv_stream):
+            kv_pre = self.wkv(hidden_states)
+            _debug_dump("attn_kv_pre_norm", kv_pre, self.layer_idx)
+            kv = self.kv_norm(kv_pre)
+            _debug_dump("attn_kv", kv, self.layer_idx)
+            kv = kv.unsqueeze(1)
+            _apply_rotary_interleaved_inplace(
+                self.rotary_emb, positions, kv[..., -self.rope_head_dim :]
+            )
+            _fp8_quant_dequant_inplace(kv[..., : -self.rope_head_dim], 64)
+
+        # ─── Q-side on _q_stream (concurrent with KV-side) ───
+        with torch.cuda.stream(q_stream):
+            q_lora_pre = self.wq_a(hidden_states)
+            _debug_dump("attn_q_lora_pre_norm", q_lora_pre, self.layer_idx)
+            q = self.q_norm(q_lora_pre)
+            _debug_dump("attn_q_lora", q, self.layer_idx)
+            q_flat = self.wq_b(q)
+            _debug_dump("attn_wq_b", q_flat, self.layer_idx)
+            q = q_flat.view(q_len, self.num_heads, self.head_dim)
+            # Fast path: vendored sglang per-head RMSNorm (in-place, no
+            # weight) collapses square + mean + rsqrt + mul into one CUDA
+            # kernel. Falls back to the eager 5-launch chain when the
+            # vendor isn't built or shapes don't match.
+            if (
+                _SGL_RMSNORM_SELF is not None
+                and q.is_cuda
+                and q.dtype == torch.bfloat16
+                and q.is_contiguous()
+                and q.shape[-1] == self.head_dim
+            ):
+                try:
+                    q = _SGL_RMSNORM_SELF(q, float(self.rms_norm_eps))
+                except Exception as _exc:
+                    global _RMSNORM_SELF_WARNED
+                    if "_RMSNORM_SELF_WARNED" not in globals():
+                        _RMSNORM_SELF_WARNED = set()
+                    _key = type(_exc).__name__
+                    if _key not in _RMSNORM_SELF_WARNED:
+                        _RMSNORM_SELF_WARNED.add(_key)
+                        from nanodeploy.logging import get_logger
+
+                        get_logger().warning(
+                            "rmsnorm_self fast path bailed: %s. q.shape=%s "
+                            "dtype=%s contig=%s. Eager fallback.",
+                            _exc,
+                            tuple(q.shape),
+                            q.dtype,
+                            q.is_contiguous(),
+                        )
+                    q = q * torch.rsqrt(
+                        q.square().mean(-1, keepdim=True) + self.rms_norm_eps
+                    )
+            else:
+                q = q * torch.rsqrt(
+                    q.square().mean(-1, keepdim=True) + self.rms_norm_eps
+                )
+            _debug_dump("attn_q_normed", q, self.layer_idx)
+            # In-place RoPE on Q's rope tail.
+            _apply_rotary_interleaved_inplace(
+                self.rotary_emb, positions, q[..., -self.rope_head_dim :]
+            )
+
+        # Sync: main stream waits on both Q and KV streams before flash_mla.
+        main_stream.wait_stream(kv_stream)
+        main_stream.wait_stream(q_stream)
         _debug_dump("attn_q_after_rope", q, self.layer_idx)
         _debug_dump("attn_window_kv_after_rope", kv, self.layer_idx)
 
@@ -1651,6 +2410,10 @@ class DeepseekV4MoE(nn.Module):
             )
 
         dist_ctx = get_dist_context()
+        # DSV4 ships ``swiglu_limit=10.0`` (clamp silu(gate)*up before
+        # FP8 quant). Models without this attr leave it ``None`` and
+        # the SwiGLU kernels run with ``+inf`` (no-op clamp).
+        swiglu_limit = getattr(config, "swiglu_limit", None)
         self.routed_experts = get_backend().get_distributed_routed_experts(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -1663,6 +2426,7 @@ class DeepseekV4MoE(nn.Module):
             scoring_func=self.score_func,
             routed_scaling_factor=self.route_scale,
             layer_idx=layer_idx,
+            swiglu_limit=swiglu_limit,
         )
         assert config.n_shared_experts == 1
         self.shared_experts = DeepseekV2MLP(
@@ -1672,6 +2436,12 @@ class DeepseekV4MoE(nn.Module):
             config=config,
             quantization_config=quantization_config,
         )
+        # Alt stream for shared_experts overlap with routed_experts (deep_ep
+        # dispatch + experts + combine). Mirrors sglang's SBO pattern: while
+        # routed_experts is mostly RDMA-bound (dispatch + combine ~2 ms), the
+        # shared MLP (~500 µs of FP8 GEMMs) runs concurrently on the alt
+        # stream. Lazily allocated on first forward.
+        self._shared_stream: torch.cuda.Stream | None = None
 
     def _scores(self, logits: torch.Tensor) -> torch.Tensor:
         logits = logits.float()
@@ -1683,36 +2453,129 @@ class DeepseekV4MoE(nn.Module):
             return F.softplus(logits).sqrt()
         raise ValueError(f"Unsupported DeepseekV4 score_func={self.score_func}")
 
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _routing_scores_with_bias(
+        logits: torch.Tensor, bias: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused: gate-logits → sqrtsoftplus scores (untouched, used for
+        weight gather later) and choice_scores (with e_score_correction_bias
+        applied). inductor fuses softplus + sqrt + add (3 launches → 1).
+        """
+        scores = logits.float()
+        scores = F.softplus(scores).sqrt()
+        choice_scores = scores + bias.float()
+        return scores, choice_scores
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _normalize_topk_weights(
+        scores: torch.Tensor,
+        topk_ids: torch.Tensor,
+        route_scale: float,
+    ) -> torch.Tensor:
+        """Fused: gather → renorm by sum → mul by route_scale. Inductor
+        fuses the post-gather chain (4-5 launches → 1)."""
+        topk_weights = scores.gather(1, topk_ids)
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        topk_weights = topk_weights * route_scale
+        return topk_weights
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _fuse_routed_shared(
+        routed_out: torch.Tensor, shared_out: torch.Tensor
+    ) -> torch.Tensor:
+        """Compile-fused post-MoE combine: ``out = routed + shared``.
+
+        Trivially small (one bf16 add on [T, 4096]) but each MoE layer
+        otherwise emits a free-floating ``vectorized_elementwise_kernel``
+        launch under graph replay. Putting this in a compile region
+        lets inductor sometimes co-locate it with adjacent kernels.
+
+        Note: ``route_scale`` is already baked into ``topk_weights`` by
+        ``_normalize_topk_weights`` upstream, and the cross-expert
+        topk-weighted sum is done by ``deep_ep::internode_ll::combine``
+        inside ``routed_experts``. sglang's
+        ``moe_sum_reduce_warp_per_token_vec_kernel`` is the TP-topology
+        equivalent of those, so unnecessary under EP."""
+        return routed_out + shared_out
+
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor
     ) -> torch.Tensor:
         residual = hidden_states
-        scores = self._scores(self.gate(hidden_states))
+        logits = self.gate(hidden_states)
         if self.hash:
+            scores = self._scores(logits)
             topk_ids = self.gate.tid2eid[input_ids].long()
+            topk_weights = scores.gather(1, topk_ids)
+            if self.score_func != "softmax":
+                topk_weights = topk_weights / (
+                    topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+                )
+            topk_weights = topk_weights * self.route_scale
+        elif (
+            self.score_func == "sqrtsoftplus"
+            and self.gate.e_score_correction_bias is not None
+        ):
+            # Fast path: torch.compile-fused scoring + topk-normalization.
+            # Covers the production DSV4 config; falls through for softmax
+            # / sigmoid score_funcs and bias-less gates.
+            scores, choice_scores = self._routing_scores_with_bias(
+                logits, self.gate.e_score_correction_bias
+            )
+            topk_ids = torch.topk(choice_scores, k=self.top_k, dim=-1, sorted=False)[1]
+            topk_weights = self._normalize_topk_weights(
+                scores, topk_ids, self.route_scale
+            )
         else:
+            scores = self._scores(logits)
             choice_scores = scores
             if self.gate.e_score_correction_bias is not None:
                 choice_scores = (
                     choice_scores + self.gate.e_score_correction_bias.float()
                 )
             topk_ids = torch.topk(choice_scores, k=self.top_k, dim=-1, sorted=False)[1]
-        topk_weights = scores.gather(1, topk_ids)
-        if self.score_func != "softmax":
-            topk_weights = topk_weights / (
-                topk_weights.sum(dim=-1, keepdim=True) + 1e-20
-            )
-        topk_weights = topk_weights * self.route_scale
+            topk_weights = scores.gather(1, topk_ids)
+            if self.score_func != "softmax":
+                topk_weights = topk_weights / (
+                    topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+                )
+            topk_weights = topk_weights * self.route_scale
         _debug_dump("moe_scores", scores, self.layer_idx)
         _debug_dump("moe_topk_ids", topk_ids, self.layer_idx)
         _debug_dump("moe_topk_weights", topk_weights, self.layer_idx)
-        out = self.routed_experts(
-            hidden_states, topk_ids, topk_weights, is_prefill=get_context().is_prefill
-        )
+
+        # SBO: launch shared_experts on alt stream BEFORE routed_experts so
+        # the dense shared MLP overlaps with deep_ep dispatch + expert compute
+        # + combine. Main stream waits before _fuse_routed_shared. Skip on
+        # prefill (routed_experts behaviour differs and the alt stream's
+        # benefit is small for batched prefill).
+        is_prefill = get_context().is_prefill
+        use_shared_stream = not is_prefill
+        if use_shared_stream:
+            if self._shared_stream is None:
+                self._shared_stream = torch.cuda.Stream()
+            shared_stream = self._shared_stream
+            main_stream = torch.cuda.current_stream()
+            shared_stream.wait_stream(main_stream)
+            with torch.cuda.stream(shared_stream):
+                shared = self.shared_experts(residual)
+            # Re-pin to main_stream after the with block (option 3).
+            torch.cuda.set_stream(main_stream)
+            out = self.routed_experts(
+                hidden_states, topk_ids, topk_weights, is_prefill=is_prefill
+            )
+            main_stream.wait_stream(shared_stream)
+        else:
+            out = self.routed_experts(
+                hidden_states, topk_ids, topk_weights, is_prefill=is_prefill
+            )
+            shared = self.shared_experts(residual)
         _debug_dump("moe_routed_out", out, self.layer_idx)
-        shared = self.shared_experts(residual)
         _debug_dump("moe_shared_out", shared, self.layer_idx)
-        out = out + shared
+        out = self._fuse_routed_shared(out, shared)
         _debug_dump("moe_out", out, self.layer_idx)
         return out
 
@@ -1733,13 +2596,36 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_ffn = DeepseekV4HCProjector(
             config.hidden_size, config.hc_mult, config.hc_sinkhorn_iters, config.hc_eps
         )
+        # Alt stream for HC pre/post tilelang kernels (option 2). Sglang
+        # records these on alt streams in their trace; mirroring that lets
+        # the SM scheduler co-issue them with neighbouring main-stream
+        # kernels. Lazily allocated on first forward.
+        self._hc_stream: torch.cuda.Stream | None = None
 
     @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
     def _hc_post(
         x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
     ):
+        # Reference (model.py:684-687):
+        #     y = post[..., None] * x[..., None, :]
+        #         + sum(comb[..., None] * residual[..., None, :], dim=-3)
+        # i.e. y[..., k, d] = sum_j comb[..., j, k] * residual[..., j, d]
+        # — that's ``comb.T @ residual`` over the hc axis. The earlier
+        # NanoDeploy form ``residual.unsqueeze(1)`` + ``sum(dim=2)``
+        # contracted on the wrong index (computed ``comb @ residual``),
+        # which only matches the reference when ``comb`` is symmetric;
+        # after sinkhorn it generally isn't, so every layer accumulated
+        # token-level drift twice (post-attn and post-ffn). Verified
+        # against the 4D reference at ``T=8, hc=4, d=8`` to give a
+        # bit-identical result.
+        #
+        # ``@torch.compile`` lets inductor fuse the broadcast-multiply +
+        # reduce-sum + add chain (4-5 launches per call) into a single
+        # fused-reduce kernel. Called twice per layer × 43 layers per
+        # decode step = 86 calls/step → ~350 launches/step collapsed.
         return post.unsqueeze(-1) * x.unsqueeze(1) + torch.sum(
-            comb.unsqueeze(-1) * residual.unsqueeze(1), dim=2
+            comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=1
         )
 
     def forward(
@@ -1750,7 +2636,21 @@ class DeepseekV4DecoderLayer(nn.Module):
     ):
         _debug_dump("layer_input", hidden_states, self.layer_idx)
         residual = hidden_states
-        x, post, comb = self.hc_attn(hidden_states)
+
+        # Option 2: HC pre/post on alt stream. Mirrors sglang's per-stream
+        # kernel attribution. Limited overlap window (HC outputs feed
+        # directly into the next op), but the SM scheduler can still
+        # co-issue these tilelang kernels with main-stream work.
+        if self._hc_stream is None:
+            self._hc_stream = torch.cuda.Stream()
+        hc_stream = self._hc_stream
+        main_stream = torch.cuda.current_stream()
+
+        hc_stream.wait_stream(main_stream)
+        with torch.cuda.stream(hc_stream):
+            x, post, comb = self.hc_attn(hidden_states)
+        torch.cuda.set_stream(main_stream)
+        main_stream.wait_stream(hc_stream)
         _debug_dump("hc_attn_y", x, self.layer_idx)
         _debug_dump("hc_attn_post", post, self.layer_idx)
         _debug_dump("hc_attn_comb", comb, self.layer_idx)
@@ -1758,17 +2658,31 @@ class DeepseekV4DecoderLayer(nn.Module):
         _debug_dump("attn_norm", x, self.layer_idx)
         x = self.self_attn(positions, x)
         _debug_dump("attn_block_out", x, self.layer_idx)
-        hidden_states = self._hc_post(x, residual, post, comb)
+
+        hc_stream.wait_stream(main_stream)
+        with torch.cuda.stream(hc_stream):
+            hidden_states = self._hc_post(x, residual, post, comb)
+        torch.cuda.set_stream(main_stream)
+        main_stream.wait_stream(hc_stream)
         _debug_dump("after_attn_hc", hidden_states, self.layer_idx)
 
         residual = hidden_states
-        x, post, comb = self.hc_ffn(hidden_states)
+        hc_stream.wait_stream(main_stream)
+        with torch.cuda.stream(hc_stream):
+            x, post, comb = self.hc_ffn(hidden_states)
+        torch.cuda.set_stream(main_stream)
+        main_stream.wait_stream(hc_stream)
         _debug_dump("hc_ffn_y", x, self.layer_idx)
         x = self.post_attention_layernorm(x)
         _debug_dump("ffn_norm", x, self.layer_idx)
         x = self.mlp(x, input_ids)
         _debug_dump("ffn_block_out", x, self.layer_idx)
-        out = self._hc_post(x, residual, post, comb)
+
+        hc_stream.wait_stream(main_stream)
+        with torch.cuda.stream(hc_stream):
+            out = self._hc_post(x, residual, post, comb)
+        torch.cuda.set_stream(main_stream)
+        main_stream.wait_stream(hc_stream)
         _debug_dump("layer_out", out, self.layer_idx)
         return out
 

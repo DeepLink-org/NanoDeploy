@@ -1,9 +1,85 @@
 import os
 import threading
+import time as _time
 
 import ray
 import torch
 import torch.distributed as dist
+
+
+# ─── Per-step host-critical-path timer ─────────────────────────────────────
+# Driver enables via ``Config.step_timing=True`` (threaded into RunnerConfig
+# in ModelRunner.__init__). Useful for quantifying the gap between
+# consecutive cudaGraphLaunch invocations — the GPU-idle window the
+# device-signal + pingpong scheduling work would target. Reading
+# RunnerConfig (not os.environ) avoids Ray actor env-var mismatch.
+
+
+class _StepTimer:
+    """Lightweight host timer capturing intra-step phase boundaries.
+
+    Phases logged (decode):
+        rpc_in       — extract_aux_from_bytes (deserialize input bytes)
+        prep         — prepare_decode_bytes (positions/slot_mapping/block_table)
+        forward      — run_model (graph.replay) + GPU-side execution
+        sample       — _standard_sample (sampler kernel + GPU execution)
+        tail         — token append + IPC wait until next step starts
+
+    Phases include a ``torch.cuda.synchronize()`` at each mark so we
+    attribute GPU compute to the phase that issued it. Without this,
+    everything looks instant (because graph.replay is async) and the
+    real GPU work piles into ``tail`` alongside the IPC wait. Sync
+    overhead is ~5-10us per mark → ~30-50us per step, well under 1%
+    of a 24ms decode step.
+
+    Total = sum of phases ≈ run_from_bytes wall.
+    """
+
+    __slots__ = ("ts",)
+
+    def __init__(self) -> None:
+        self.ts: list[tuple[str, int]] = []
+
+    def mark(self, phase: str) -> None:
+        # Sync first so the timestamp captures "all GPU work issued up
+        # to this point has completed". Cheap when GPU is idle, blocks
+        # for the actual compute time when it's busy.
+        if torch.cuda.is_initialized():
+            torch.cuda.synchronize()
+        self.ts.append((phase, _time.perf_counter_ns()))
+
+    def report(
+        self,
+        rank: int,
+        run_count: int,
+        num_seqs: int,
+        is_prefill: bool,
+        interval: int,
+        rank_only: int,
+    ) -> None:
+        if rank_only >= 0 and rank != rank_only:
+            return
+        if run_count % interval != 0:
+            return
+        if len(self.ts) < 2:
+            return
+        deltas = []
+        for i in range(1, len(self.ts)):
+            label, t = self.ts[i]
+            deltas.append((label, t - self.ts[i - 1][1]))
+        total_ns = self.ts[-1][1] - self.ts[0][1]
+        total_us = total_ns / 1000
+        parts = "  ".join(
+            f"{label}={dur/1000:.2f}us({dur/total_ns*100:.0f}%)"
+            for label, dur in deltas
+        )
+        kind = "prefill" if is_prefill else "decode"
+        get_logger().info(
+            f"[step_timing] r{rank} {kind} step={run_count} "
+            f"num_seqs={num_seqs} total={total_us:.2f}us  {parts}"
+        )
+
+
 from nanodeploy._cpp import (
     extract_aux_from_bytes,
     extract_vision_slots_from_bytes,
@@ -95,6 +171,13 @@ class ModelRunner:
             dummy_weight=config.dummy_weight,
             dummy_eplb=config.dummy_eplb,
             enable_eplb=config.enable_eplb,
+            use_mega_moe=getattr(config, "use_mega_moe", False),
+            mega_moe_max_tokens_per_rank=getattr(
+                config, "mega_moe_max_tokens_per_rank", 256
+            ),
+            step_timing=getattr(config, "step_timing", False),
+            step_timing_interval=getattr(config, "step_timing_interval", 16),
+            step_timing_rank=getattr(config, "step_timing_rank", 0),
         )
 
         if defer_dist_init:
@@ -175,7 +258,17 @@ class ModelRunner:
         if getattr(config, "enable_profiler", False):
             self.profiler_start_step = getattr(config, "profiler_start_step", 10)
             self.profiler_steps = getattr(config, "profiling_step", 10)
-            self.profiler_end_step = self.profiler_start_step + self.profiler_steps
+            # Number of forward iterations bundled into one profiler.step()
+            # boundary. Default 2 -- amortises per-step bookkeeping overhead
+            # so the captured trace better reflects steady-state cost.
+            # Total forwards captured = profiler_steps * forward_per_step.
+            self.profiler_forward_per_step = max(
+                1, getattr(config, "profiler_forward_per_step", 2)
+            )
+            self.profiler_end_step = (
+                self.profiler_start_step
+                + self.profiler_steps * self.profiler_forward_per_step
+            )
             profiler_dir = getattr(config, "profiler_dir", "./profiler_logs")
 
             os.makedirs(profiler_dir, exist_ok=True)
@@ -196,7 +289,10 @@ class ModelRunner:
                 with_stack=True,
             )
             logger.info(
-                f"Rank {rank}: Profiler enabled. Start at {self.profiler_start_step}, duration {self.profiler_steps} steps."
+                f"Rank {rank}: Profiler enabled. Start at {self.profiler_start_step}, "
+                f"{self.profiler_steps} step boundaries × "
+                f"{self.profiler_forward_per_step} forwards/step "
+                f"(end at {self.profiler_end_step})."
             )
 
         # Initialise the hardware backend before constructing the model so that
@@ -440,19 +536,21 @@ class ModelRunner:
         agent_alias = f"{self.engine_id}:rpc:{self.rank}"
         device = available_nics[get_dist_context().local_rank % len(available_nics)]
         self._dlslime_agent = dlslime.start_peer_agent(
+            nanoctrl_url=self.config.nanoctrl_address,
             alias=agent_alias,
-            server_url=self.config.nanoctrl_address,
             device=device,
-            ib_port=1,
-            link_type="RoCE",
-            qp_num=int(os.environ.get("SLIME_QP_NUM", 1)),
             scope=self.config.nanoctrl_scope,
         )
+        self._dlslime_qp_num = int(os.environ.get("SLIME_QP_NUM", 1))
         service = ModelRunnerRpcService(self)
 
         def _serve_loop():
-            self._dlslime_agent.set_desired_topology([driver_alias])
-            self._dlslime_agent.wait_for_peers([driver_alias], timeout_sec=30)
+            conn = self._dlslime_agent.connect_to(
+                driver_alias,
+                ib_port=1,
+                qp_num=self._dlslime_qp_num,
+            )
+            conn.wait(timeout=30)
             serve(self._dlslime_agent, service, driver_alias)
 
         self._dlslime_thread = threading.Thread(
@@ -659,9 +757,16 @@ class ModelRunner:
     @torch.inference_mode()
     def run_from_bytes(self, data: bytes, is_prefill: bool) -> list[list[int]]:
         """Run model from lean RunBatchInput bytes (completely Sequence-free)."""
+        _rcfg = get_runner_config()
+        _timing = _rcfg.step_timing
+        _timer = _StepTimer() if _timing else None
+        if _timer is not None:
+            _timer.mark("start")
         sp_rank = get_dist_context().attn_sp_rank
         aux = extract_aux_from_bytes(data, sp_rank)
         num_seqs = aux.num_group_seqs
+        if _timer is not None:
+            _timer.mark("rpc_in")
 
         is_dummy = False
         if num_seqs == 0:
@@ -719,6 +824,8 @@ class ModelRunner:
                     input_ids, positions = self.input_preparer.update_decode_inplace(
                         input_ids, positions, num_seqs
                     )
+                if _timer is not None and i == 0:
+                    _timer.mark("prep")
 
                 if (
                     self.mtp_worker is not None
@@ -744,6 +851,8 @@ class ModelRunner:
 
             # --- Forward ---
             logits = self.run_model(input_ids, positions, is_prefill)
+            if _timer is not None and i == 0:
+                _timer.mark("forward")
             if is_prefill and self.vision_manager.has_embeds:
                 self.vision_manager.clear()
 
@@ -758,6 +867,8 @@ class ModelRunner:
                 input_ids = self._standard_sample(
                     logits, input_ids, aux, num_seqs, is_prefill
                 )
+            if _timer is not None and i == 0:
+                _timer.mark("sample")
 
             # --- MTP draft generation ---
             if self.mtp_worker is not None and not is_prefill and not is_dummy:
@@ -768,7 +879,12 @@ class ModelRunner:
             # --- Profiler step ---
             if self.profiler and self.run_count >= self.profiler_start_step:
                 if self.run_count < self.profiler_end_step:
-                    self.profiler.step()
+                    # Bundle ``profiler_forward_per_step`` forwards into one
+                    # profiler.step() boundary so per-step bookkeeping doesn't
+                    # dominate the trace at small per-iter latencies.
+                    rel = self.run_count - self.profiler_start_step
+                    if (rel + 1) % self.profiler_forward_per_step == 0:
+                        self.profiler.step()
                 if self.run_count == self.profiler_end_step - 1:
                     self.profiler.stop()
                     logger.info(
@@ -784,6 +900,16 @@ class ModelRunner:
         else:
             result = torch.cat(get_context().token_ids, dim=0).T.tolist()
         reset_context()
+        if _timer is not None:
+            _timer.mark("tail")
+            _timer.report(
+                self.rank,
+                self.run_count,
+                num_seqs,
+                is_prefill,
+                _rcfg.step_timing_interval,
+                _rcfg.step_timing_rank,
+            )
         return result
 
     def _init_graph_runners(self):
