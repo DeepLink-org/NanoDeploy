@@ -8,6 +8,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from nanodeploy._third_party.sglang_jit_kernel import (
+    fused_kernels_enabled as _sglang_fused_kernels_enabled,
+)
 from nanodeploy.backends import get_backend
 from nanodeploy.backends.gpu_generic.kernels.kv_store import store_kvcache
 from nanodeploy.context.context import get_context
@@ -19,6 +22,105 @@ from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.models.deepseek_v2.deepseek_v2 import DeepseekV2MLP
 from nanodeploy.models.quant_config import QuantizationConfig
 
+
+# --- Lazily-compiled helpers ----------------------------------------------
+# Applying ``@torch.compile`` directly as a class-method decorator attaches
+# ConfigModuleInstance references to the class, which break cloudpickle in
+# Ray actors on torch >= 2.10. The class methods below are kept as thin
+# trampolines; their bodies live in module-level functions that are
+# compiled on first call.
+def _routing_scores_with_bias_impl(
+    logits: torch.Tensor, bias: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scores = logits.float()
+    scores = F.softplus(scores).sqrt()
+    choice_scores = scores + bias.float()
+    return scores, choice_scores
+
+
+def _normalize_topk_weights_impl(
+    scores: torch.Tensor, topk_ids: torch.Tensor, route_scale: float
+) -> torch.Tensor:
+    topk_weights = scores.gather(1, topk_ids)
+    topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    topk_weights = topk_weights * route_scale
+    return topk_weights
+
+
+def _fuse_routed_shared_impl(
+    routed_out: torch.Tensor, shared_out: torch.Tensor
+) -> torch.Tensor:
+    return routed_out + shared_out
+
+
+def _hc_post_impl(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    return post.unsqueeze(-1) * x.unsqueeze(1) + torch.sum(
+        comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=1
+    )
+
+
+_routing_scores_with_bias_fn = None
+_normalize_topk_weights_fn = None
+_fuse_routed_shared_fn = None
+_hc_post_fn = None
+
+
+def _routing_scores_with_bias_compiled(
+    logits: torch.Tensor, bias: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global _routing_scores_with_bias_fn
+    if _routing_scores_with_bias_fn is None:
+        _routing_scores_with_bias_fn = torch.compile(
+            _routing_scores_with_bias_impl, dynamic=False, fullgraph=True
+        )
+    return _routing_scores_with_bias_fn(logits, bias)
+
+
+def _normalize_topk_weights_compiled(
+    scores: torch.Tensor, topk_ids: torch.Tensor, route_scale: float
+) -> torch.Tensor:
+    global _normalize_topk_weights_fn
+    if _normalize_topk_weights_fn is None:
+        _normalize_topk_weights_fn = torch.compile(
+            _normalize_topk_weights_impl, dynamic=False, fullgraph=True
+        )
+    return _normalize_topk_weights_fn(scores, topk_ids, route_scale)
+
+
+def _fuse_routed_shared_compiled(
+    routed_out: torch.Tensor, shared_out: torch.Tensor
+) -> torch.Tensor:
+    global _fuse_routed_shared_fn
+    if _fuse_routed_shared_fn is None:
+        _fuse_routed_shared_fn = torch.compile(
+            _fuse_routed_shared_impl, dynamic=False, fullgraph=True
+        )
+    return _fuse_routed_shared_fn(routed_out, shared_out)
+
+
+def _hc_post_compiled(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    global _hc_post_fn
+    if _hc_post_fn is None:
+        _hc_post_fn = torch.compile(_hc_post_impl, dynamic=False, fullgraph=True)
+    return _hc_post_fn(x, residual, post, comb)
+
+
+# Gate every Hopper-only fused kernel (vendored sglang JIT + tilelang)
+# behind a single GPU-arch check. On non-Hopper GPUs these stay ``None``
+# and each call site uses its eager fallback (CUDAGraph still allowed).
+_DSV4_FUSED_KERNELS = _sglang_fused_kernels_enabled()
+
+
 # Optional vendored sglang DSV4 fused kernels. When present,
 # _apply_rotary_interleaved replaces ~10 eager elementwise launches per
 # call with a single CUDA kernel.
@@ -26,16 +128,22 @@ from nanodeploy.models.quant_config import QuantizationConfig
 #   https://github.com/sgl-project/sglang
 #   python/sglang/jit_kernel/deepseek_v4.py::fused_rope
 # Runtime deps for the vendored slice: torch, triton, tvm-ffi.
-try:
-    from nanodeploy._third_party.sglang_jit_kernel.deepseek_v4 import (
-        fused_norm_rope_inplace as _SGL_FUSED_NORM_ROPE,
-        fused_rope as _SGL_FUSED_ROPE,
-        rmsnorm_self as _SGL_RMSNORM_SELF,
-    )
-except Exception:
-    # ImportError if tvm-ffi isn't installed; any other Exception if
-    # the vendored layout is broken on this checkout. Fall back to
-    # eager either way.
+if _DSV4_FUSED_KERNELS:
+    try:
+        from nanodeploy._third_party.sglang_jit_kernel.deepseek_v4 import (
+            fused_norm_rope_inplace as _SGL_FUSED_NORM_ROPE,
+            fused_rope as _SGL_FUSED_ROPE,
+            rmsnorm_self as _SGL_RMSNORM_SELF,
+        )
+    except Exception:
+        # ImportError if tvm-ffi isn't installed; any other Exception if
+        # the vendored layout is broken on this checkout. Fall back to
+        # eager either way.
+        _SGL_FUSED_ROPE = None
+        _SGL_FUSED_NORM_ROPE = None
+        _SGL_RMSNORM_SELF = None
+else:
+    # Non-Hopper (or explicitly disabled): use the eager RoPE/RMSNorm path.
     _SGL_FUSED_ROPE = None
     _SGL_FUSED_NORM_ROPE = None
     _SGL_RMSNORM_SELF = None
@@ -85,12 +193,17 @@ except Exception:
 # co-launch — the HC eager fallback fired, adding ~12k extra kernels per
 # step and a 40% throughput regression. Rewriting in tilelang keeps both
 # kernels on the same runtime and avoids the conflict.
-try:
-    from nanodeploy.models.deepseek_v4.compress_kernels import (
-        compress_no_overlap_softmax_sum as _TILE_COMPRESS_NO_OVERLAP,
-        compress_overlap_softmax_sum as _TILE_COMPRESS_OVERLAP,
-    )
-except Exception:
+if _DSV4_FUSED_KERNELS:
+    try:
+        from nanodeploy.models.deepseek_v4.compress_kernels import (
+            compress_no_overlap_softmax_sum as _TILE_COMPRESS_NO_OVERLAP,
+            compress_overlap_softmax_sum as _TILE_COMPRESS_OVERLAP,
+        )
+    except Exception:
+        _TILE_COMPRESS_OVERLAP = None
+        _TILE_COMPRESS_NO_OVERLAP = None
+else:
+    # Non-Hopper: eager cat-rearrange + softmax + weighted-sum fallback.
     _TILE_COMPRESS_OVERLAP = None
     _TILE_COMPRESS_NO_OVERLAP = None
 
@@ -99,9 +212,13 @@ except Exception:
 # DeepseekV4HCProjector.forward into 2-3 tilelang kernels.
 # Source: https://github.com/sgl-project/sglang
 #   python/sglang/srt/layers/mhc.py
-try:
-    from nanodeploy._third_party.sglang_mhc import mhc_pre as _SGL_MHC_PRE
-except Exception:
+if _DSV4_FUSED_KERNELS:
+    try:
+        from nanodeploy._third_party.sglang_mhc import mhc_pre as _SGL_MHC_PRE
+    except Exception:
+        _SGL_MHC_PRE = None
+else:
+    # Non-Hopper: eager F.linear + RMSNorm + sigmoid + sinkhorn fallback.
     _SGL_MHC_PRE = None
 
 
@@ -2454,7 +2571,6 @@ class DeepseekV4MoE(nn.Module):
         raise ValueError(f"Unsupported DeepseekV4 score_func={self.score_func}")
 
     @staticmethod
-    @torch.compile(dynamic=False, fullgraph=True)
     def _routing_scores_with_bias(
         logits: torch.Tensor, bias: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2462,13 +2578,9 @@ class DeepseekV4MoE(nn.Module):
         weight gather later) and choice_scores (with e_score_correction_bias
         applied). inductor fuses softplus + sqrt + add (3 launches → 1).
         """
-        scores = logits.float()
-        scores = F.softplus(scores).sqrt()
-        choice_scores = scores + bias.float()
-        return scores, choice_scores
+        return _routing_scores_with_bias_compiled(logits, bias)
 
     @staticmethod
-    @torch.compile(dynamic=False, fullgraph=True)
     def _normalize_topk_weights(
         scores: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -2476,13 +2588,9 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         """Fused: gather → renorm by sum → mul by route_scale. Inductor
         fuses the post-gather chain (4-5 launches → 1)."""
-        topk_weights = scores.gather(1, topk_ids)
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        topk_weights = topk_weights * route_scale
-        return topk_weights
+        return _normalize_topk_weights_compiled(scores, topk_ids, route_scale)
 
     @staticmethod
-    @torch.compile(dynamic=False, fullgraph=True)
     def _fuse_routed_shared(
         routed_out: torch.Tensor, shared_out: torch.Tensor
     ) -> torch.Tensor:
@@ -2499,7 +2607,7 @@ class DeepseekV4MoE(nn.Module):
         inside ``routed_experts``. sglang's
         ``moe_sum_reduce_warp_per_token_vec_kernel`` is the TP-topology
         equivalent of those, so unnecessary under EP."""
-        return routed_out + shared_out
+        return _fuse_routed_shared_compiled(routed_out, shared_out)
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor
@@ -2603,7 +2711,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._hc_stream: torch.cuda.Stream | None = None
 
     @staticmethod
-    @torch.compile(dynamic=False, fullgraph=True)
     def _hc_post(
         x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
     ):
@@ -2624,9 +2731,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # reduce-sum + add chain (4-5 launches per call) into a single
         # fused-reduce kernel. Called twice per layer × 43 layers per
         # decode step = 86 calls/step → ~350 launches/step collapsed.
-        return post.unsqueeze(-1) * x.unsqueeze(1) + torch.sum(
-            comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=1
-        )
+        return _hc_post_compiled(x, residual, post, comb)
 
     def forward(
         self,

@@ -3,7 +3,7 @@ import json
 from typing import List, Set, Tuple
 
 import ray
-from nanoctrl.client import NanoCtrlClient
+from dlslime.ctrl import NanoCtrlClient
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nanodeploy.config import Config
@@ -41,17 +41,15 @@ class LLMComponent(LLM):
     """LLM component with lifecycle management and service discovery integration.
 
     This class extends LLM with:
-    - NanoCtrl service registration and heartbeat
+    - dlslime-ctrl service registration and heartbeat
     - Peer engine information management for distributed serving
     - Automatic resource cleanup on shutdown
     """
 
     def __init__(self, config: Config):
-        # In PD disagg mode, verify NanoCtrl is reachable before heavy model loading.
-        if config.nanoctrl_address:
-            NanoCtrlClient(
-                config.nanoctrl_address, config.nanoctrl_scope
-            ).check_connection()
+        # In PD disagg mode, verify dlslime-ctrl is reachable before heavy model loading.
+        if config.ctrl_address:
+            NanoCtrlClient(config.ctrl_address, config.ctrl_scope).check_connection()
 
         super().__init__(config)
 
@@ -67,14 +65,14 @@ class LLMComponent(LLM):
         self._p2p_clients: dict[str, any] = {}
         self._p2p_ctx = None
 
-        # NanoCtrl lifecycle client (None when nanoctrl_address is not configured)
+        # dlslime-ctrl lifecycle client (None when ctrl_address is not configured)
         self._nanoctrl: NanoCtrlClient | None = None
 
-        # Register with NanoCtrl if configured.
+        # Register with dlslime-ctrl if configured.
         # engine_server.py will re-register after binding its own P2P socket
         # (replacing p2p_port), but for direct LLMComponent usage (e.g.
         # deepseek_v3_disagg.py) this is the only registration point.
-        if self.config.nanoctrl_address:
+        if self.config.ctrl_address:
             self._register_with_nanoctrl()
 
         atexit.register(self.shutdown)
@@ -169,19 +167,19 @@ class LLMComponent(LLM):
             f"Stored peer info for {remote_engine_id}: {len(peer_addrs)} addresses, P2P={p2p_host}:{p2p_port}"
         )
 
-    def _fetch_peer_info_from_nanoctrl(self, target_engine_id: str) -> bool:
-        """Fetch peer engine info from NanoCtrl on-demand."""
+    def _fetch_peer_info_from_ctrl(self, target_engine_id: str) -> bool:
+        """Fetch peer engine info from dlslime-ctrl on-demand."""
         if self._nanoctrl is None:
-            logger.error("Cannot fetch peer info: NanoCtrl not configured")
+            logger.error("Cannot fetch peer info: dlslime-ctrl not configured")
             return False
 
         entity_info = self._nanoctrl.get_entity_info(target_engine_id)
         if entity_info:
-            logger.info(f"NanoCtrl returned entity_info: {entity_info}")
+            logger.info(f"dlslime-ctrl returned entity_info: {entity_info}")
             engine_info = dict(entity_info.get("metadata") or {})
             engine_info.setdefault("id", entity_info.get("entity_id", target_engine_id))
             self.set_peer_info(json.dumps(engine_info))
-            logger.info(f"Fetched peer info for {target_engine_id} from NanoCtrl")
+            logger.info(f"Fetched peer info for {target_engine_id} from dlslime-ctrl")
             return True
 
         logger.error(f"Failed to fetch peer info for {target_engine_id}: not found")
@@ -215,7 +213,7 @@ class LLMComponent(LLM):
 
         # Get target encoder P2P address
         if target_encoder_id not in self._peer_info:
-            if not self._fetch_peer_info_from_nanoctrl(target_encoder_id):
+            if not self._fetch_peer_info_from_ctrl(target_encoder_id):
                 logger.error(
                     f"Cannot send vision free: failed to fetch peer info for {target_encoder_id}"
                 )
@@ -308,9 +306,9 @@ class LLMComponent(LLM):
         # Get target engine P2P address from peer_info (fetch on-demand if not cached)
         if target_engine_id not in self._peer_info:
             logger.info(
-                f"Peer info for {target_engine_id} not cached, fetching from NanoCtrl..."
+                f"Peer info for {target_engine_id} not cached, fetching from dlslime-ctrl..."
             )
-            if not self._fetch_peer_info_from_nanoctrl(target_engine_id):
+            if not self._fetch_peer_info_from_ctrl(target_engine_id):
                 logger.error(
                     f"Cannot send free: failed to fetch peer info for {target_engine_id}"
                 )
@@ -373,7 +371,7 @@ class LLMComponent(LLM):
 
     def shutdown(self):
         """Shutdown the component and cleanup resources."""
-        # Stop heartbeat and unregister from NanoCtrl
+        # Stop heartbeat and unregister from dlslime-ctrl
         if hasattr(self, "_nanoctrl") and self._nanoctrl:
             self._nanoctrl.stop()
 
@@ -396,18 +394,18 @@ class LLMComponent(LLM):
         super().exit()
 
     def _register_with_nanoctrl(self):
-        """Register engine with NanoCtrl and start heartbeat.
+        """Register engine with dlslime-ctrl and start heartbeat.
 
-        Also used as the ``on_not_found`` callback — if NanoCtrl restarts and
+        Also used as the ``on_not_found`` callback — if dlslime-ctrl restarts and
         loses state, the heartbeat thread re-invokes this to re-register without
         restarting the heartbeat thread itself.
         """
-        if not self.config.nanoctrl_address:
+        if not self.config.ctrl_address:
             return
 
         if self._nanoctrl is None:
             self._nanoctrl = NanoCtrlClient(
-                self.config.nanoctrl_address, self.config.nanoctrl_scope
+                self.config.ctrl_address, self.config.ctrl_scope
             )
 
         if self.config.host in ("0.0.0.0", ""):
