@@ -4,7 +4,6 @@
 
 | Component                      | Language   | Description             | Key Features                                                                                    |
 | ------------------------------ | ---------- | ----------------------- | ----------------------------------------------------------------------------------------------- |
-| [NanoCtrl](./NanoCtrl)         | Rust       | Control plane           | Redis-backed service registry, health monitoring, engine discovery, Python client               |
 | [NanoDeploy](./NanoDeploy)     | Python/C++ | LLM inference engine    | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
 | [NanoDeployVL](./NanoDeployVL) | Python     | Vision-Language encoder | EP-separated ViT encoder, RDMA embedding transfer, Qwen3-VL support                             |
 | [NanoRoute](./NanoRoute)       | Rust       | HTTP load balancer      | OpenAI-compatible API, tool calls, routing strategies, engine discovery                         |
@@ -25,21 +24,21 @@
 
 ## ✨ Key Features
 
-| Feature                                            | Description                                                                             |
-| -------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| ✅ **Chunked Prefill**                             | Split long prompts into chunks to overlap with decode batches.                          |
-| ✅ **Continuous Batching**                         | Dynamic request scheduling with paged KV cache.                                         |
-| ✅ **CUDA Graph**                                  | Captured decode kernels for low-latency token generation.                               |
-| ✅ **Encoder-Prefill-Decode (EPD) Disaggregation** | Separate encoder, prefill and decode across GPU nodes with GPUDirect RDMA KV migration. |
-| ✅ **FP8 KV Cache**                                | Float8 (E4M3) paged KV cache, ~50% memory reduction.                                    |
-| ✅ **Gated Delta Net (GDN)**                       | Linear attention for Qwen3.5-MoE hybrid full/linear layers.                             |
-| ✅ **Multi-head Latent Attention (MLA)**           | Compressed KV cache with low-rank projection for DeepSeek-V3 family.                    |
-| ✅ **Multi-Token Prediction (MTP)**                | Speculative decoding with model-native MTP heads.                                       |
-| ✅ **Native Sparse Attention (NSA)**               | FP8 sparse decode with block-level indexing for DeepSeek-V3.2.                          |
-| ✅ **Node Discovery**                              | Automatic engine registration and heartbeat via NanoCtrl service registry.              |
-| ✅ **Prefix Caching**                              | Reuse KV cache of shared prompt prefixes across requests.                               |
-| ✅ **Tensor Parallelism (TP)**                     | Split weight matrices across GPUs for large model inference.                            |
-| ✅ **Wide Expert Parallelism**                     | MoE EP across all GPUs with attention data-parallel (`attention_dp × ffn_ep`).          |
+| Feature                                            | Description                                                                                 |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| ✅ **Chunked Prefill**                             | Split long prompts into chunks to overlap with decode batches.                              |
+| ✅ **Continuous Batching**                         | Dynamic request scheduling with paged KV cache.                                             |
+| ✅ **CUDA Graph**                                  | Captured decode kernels for low-latency token generation.                                   |
+| ✅ **Encoder-Prefill-Decode (EPD) Disaggregation** | Separate encoder, prefill and decode across GPU nodes with GPUDirect RDMA KV migration.     |
+| ✅ **FP8 KV Cache**                                | Float8 (E4M3) paged KV cache, ~50% memory reduction.                                        |
+| ✅ **Gated Delta Net (GDN)**                       | Linear attention for Qwen3.5-MoE hybrid full/linear layers.                                 |
+| ✅ **Multi-head Latent Attention (MLA)**           | Compressed KV cache with low-rank projection for DeepSeek-V3 family.                        |
+| ✅ **Multi-Token Prediction (MTP)**                | Speculative decoding with model-native MTP heads.                                           |
+| ✅ **Native Sparse Attention (NSA)**               | FP8 sparse decode with block-level indexing for DeepSeek-V3.2.                              |
+| ✅ **Node Discovery**                              | Automatic engine registration and heartbeat via the DLSlime control plane (`dlslime-ctrl`). |
+| ✅ **Prefix Caching**                              | Reuse KV cache of shared prompt prefixes across requests.                                   |
+| ✅ **Tensor Parallelism (TP)**                     | Split weight matrices across GPUs for large model inference.                                |
+| ✅ **Wide Expert Parallelism**                     | MoE EP across all GPUs with attention data-parallel (`attention_dp × ffn_ep`).              |
 
 ## 🏗️ Architecture
 
@@ -50,7 +49,7 @@ graph TB
     VL[NanoDeployVL<br/>Vision Encoder]
     Prefill[Prefill Engine<br/>Python/C++]
     Decode[Decode Engine<br/>Python/C++]
-    Ctrl[NanoCtrl<br/>Redis<br/>Service Registry]
+    Ctrl[dlslime-ctrl<br/>Redis<br/>Service Registry<br/>from DLSlime]
 
     Client -->|HTTP| Route
     Route -->|ZMQ| VL
@@ -68,22 +67,60 @@ graph TB
 
 ### Key Third-Party Dependencies
 
-| Library                                                   | Version   | Description                                                         | Source        |
-| --------------------------------------------------------- | --------- | ------------------------------------------------------------------- | ------------- |
-| [DeepEP](https://github.com/deepseek-ai/DeepEP)           | 1.2.1     | Expert-parallel all-to-all communication (MoE dispatch/combine)     | deepseek-ai   |
-| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)       | 2.1.1     | FP8 GEMM kernels with fine-grained scaling (JIT compiled)           | deepseek-ai   |
-| [FlashMLA](https://github.com/deepseek-ai/FlashMLA)       | 1.0.0     | Multi-head Latent Attention decode kernels (dense + FP8 sparse)     | deepseek-ai   |
-| [FlashInfer](https://github.com/flashinfer-ai/flashinfer) | 0.6.6     | High-performance inference kernels for attention, GDN, and sampling | flashinfer-ai |
-| [DLSlime](https://github.com/deeplink-org/DLSlime)        | 0.0.3.rc1 | Flexible heterogeneous transfer toolkit for RDMA/NVLink/NVSHMEM     | deeplink-org  |
+The Docker development image pins every external build dependency. Prefer tags when upstream provides a usable tag; otherwise pin the exact commit that has been smoke-tested.
 
-The DeepSeek kernels require SM90+ (NVIDIA Hopper) GPUs. Install the key dependencies as follows:
+| Library                                                    | Pinned version / ref                    | Notes                                                               |
+| ---------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------- |
+| PyTorch                                                    | `2.10.0+cu128`                          | CUDA 12.8 wheel.                                                    |
+| [DeepEP](https://github.com/deepseek-ai/DeepEP)            | `567632dd` (`v1.2.1-25-g567632d`)       | Nearest tag: `v1.2.1`; pinned commit is the tested post-tag build.  |
+| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)        | `891d57b4` (`v2.1.1.post3-16-g891d57b`) | Nearest tag: `v2.1.1.post3`; pinned commit reports package `2.5.0`. |
+| [FlashMLA](https://github.com/deepseek-ai/FlashMLA)        | `1408756a`                              | Upstream currently has no tags; pinned by commit.                   |
+| [FlashInfer](https://github.com/flashinfer-ai/flashinfer)  | `v0.6.9`                                | Built from source.                                                  |
+| [flash-attn](https://github.com/Dao-AILab/flash-attention) | `v2.8.1` wheel for `cu12` / `torch2.10` | Uses the release wheel.                                             |
+| [DLSlime](https://github.com/Deeplink-org/DLSlime)         | `v0.1.16`                               | Builds `dlslime`; `dlslime-ctrl` is not built in this image.        |
+| Rust                                                       | `1.95.0` via rustup                     | Minimal rustup toolchain; not installed from apt.                   |
+
+The DeepSeek kernels require SM90+ (NVIDIA Hopper) GPUs. Install the key dependencies manually as follows:
 
 ```bash
 cd DeepEP && pip install .
 cd DeepGEMM && pip install .
 cd FlashMLA && pip install .
-pip install flashinfer-python==0.6.6
-pip install dlslime==0.0.3.rc1
+pip install flashinfer-python==0.6.9
+pip install dlslime==0.1.16
+```
+
+### Docker Development Image
+
+The development container is built from `docker/Dockerfile`. It uses NVIDIA CUDA 12.8 devel, PyTorch 2.10 CUDA 12.8, source-built DeepEP/DeepGEMM/FlashMLA/FlashInfer, release-wheel flash-attn, rustup-managed Rust, and the build toolchains needed for NanoDeploy. The image intentionally does not include the NanoDeploy source tree; mount or clone NanoDeploy inside the container and install it there. This keeps the expensive dependency layers reusable across source changes.
+
+Build:
+
+```bash
+docker build --network host \
+  -f docker/Dockerfile \
+  -t nanodeploy:0.2.0-cu128-devel \
+  .
+```
+
+Private mirrors or proxies can be passed with Docker build args in local environments; the image does not require them.
+
+Run for local development:
+
+```bash
+docker run --gpus all --rm -it --network host --ipc=host \
+  --cap-add IPC_LOCK --ulimit memlock=-1:-1 \
+  --device=/dev/infiniband \
+  -v /sys/class/infiniband:/sys/class/infiniband:ro \
+  -v $PWD:/workspace/NanoDeploy \
+  -w /workspace/NanoDeploy/NanoDeploy \
+  nanodeploy:0.2.0-cu128-devel
+```
+
+Inside the container, install NanoDeploy from the mounted checkout:
+
+```bash
+python3 -m pip install --break-system-packages --no-build-isolation -v -e .
 ```
 
 ### One-liner: install everything
@@ -95,10 +132,18 @@ pip install ".[all]"
 ### Install individual components
 
 ```bash
-pip install ".[nanoctrl]"     # NanoCtrl lifecycle client only
 pip install ".[nanodeploy]"   # NanoDeploy inference engine only
 pip install ".[nanodeployvl]" # NanoDeployVL vision-language encoder only
 ```
+
+> The control-plane server (`dlslime-ctrl`) and its Python client (`dlslime.ctrl.NanoCtrlClient`)
+> now live in the [DLSlime](https://github.com/DeepLink-org/DLSlime) repo. Install them via:
+>
+> ```bash
+> pip install dlslime           # PeerAgent + NanoCtrlClient (data-plane wheel)
+> pip install dlslime-ctrl      # Rust control-plane server binary
+> # or, from a DLSlime checkout: pip install -e ./dlslime ./dlslime-ctrl
+> ```
 
 ### For developers
 
@@ -109,8 +154,8 @@ cd NanoDeploy && pip install -e . && cd ..
 # Build NanoRoute (Rust)
 cd NanoRoute && cargo build --release && cd ..
 
-# Build NanoCtrl (Rust) + install Python client
-cd NanoCtrl && cargo build --release && pip install -e . && cd ..
+# Build dlslime-ctrl (Rust) from the DLSlime checkout
+cd /path/to/DLSlime/dlslime-ctrl && cargo build --release && cd -
 ```
 
 ## Quick Start: LLM Inference
@@ -136,7 +181,7 @@ ray start --address <node0-ip>:7078
 
 Batch generation without HTTP serving.
 
-#### Single node (no NanoCtrl needed)
+#### Single node (no dlslime-ctrl needed)
 
 ```bash
 python NanoDeploy/examples/non_disagg.py \
@@ -150,11 +195,11 @@ python NanoDeploy/examples/non_disagg.py \
 
 #### PD disaggregated (2 nodes)
 
-##### 2. Start Redis + NanoCtrl
+##### 2. Start Redis + dlslime-ctrl
 
 ```bash
 redis-server --bind 0.0.0.0 --port 6379
-cd NanoCtrl && cargo run --release -- server --redis-url redis://127.0.0.1:6379
+dlslime-ctrl server --redis-url redis://127.0.0.1:6379
 ```
 
 ##### 3. Launch engines
@@ -163,7 +208,7 @@ cd NanoCtrl && cargo run --release -- server --redis-url redis://127.0.0.1:6379
 python NanoDeploy/examples/disagg.py \
     --model /models/Qwen3-235B-A22B \
     --ray_address <node0-ip>:7078 \
-    --nanoctrl_address <node0-ip>:3000 \
+    --ctrl_address <node0-ip>:4479 \
     --attention_dp 8 --ffn_ep 8 \
     --prefill.master_address <node0-ip>:6006 \
     --decode.master_address <node1-ip>:6006
@@ -173,17 +218,17 @@ python NanoDeploy/examples/disagg.py \
 
 ZMQ engine servers with OpenAI-compatible HTTP API via NanoRoute.
 
-##### 2. Start Redis + NanoCtrl
+##### 2. Start Redis + dlslime-ctrl
 
 ```bash
 redis-server --bind 0.0.0.0 --port 6379
-cd NanoCtrl && cargo run --release -- server --redis-url redis://127.0.0.1:6379
+dlslime-ctrl server --redis-url redis://127.0.0.1:6379
 ```
 
 ##### 3. Start NanoRoute
 
 ```bash
-cd NanoRoute && cargo run --release    # edit config.toml to set nanoctrl_address
+cd NanoRoute && cargo run --release    # edit config.toml to set ctrl_address
 ```
 
 ##### 4. Launch engines
@@ -194,8 +239,8 @@ python NanoDeploy/nanodeploy/server/engine_server.py \
     --model /models/Qwen3-235B-A22B \
     --mode decode \
     --ray_address <node0-ip>:7078 \
-    --nanoctrl_address <node0-ip>:3000 \
-    --nanoctrl_scope nanoctrl-0 \
+    --ctrl_address <node0-ip>:4479 \
+    --ctrl_scope nanoctrl-0 \
     --master_address <node1-ip>:6006 \
     --host <node0-ip> --port 6001 \
     --attention_dp 8 --ffn_ep 8 \
@@ -207,8 +252,8 @@ python NanoDeploy/nanodeploy/server/engine_server.py \
     --model /models/Qwen3-235B-A22B \
     --mode prefill \
     --ray_address <node0-ip>:7078 \
-    --nanoctrl_address <node0-ip>:3000 \
-    --nanoctrl_scope nanoctrl-0 \
+    --ctrl_address <node0-ip>:4479 \
+    --ctrl_scope nanoctrl-0 \
     --master_address <node0-ip>:6006 \
     --host <node0-ip> --port 6002 \
     --attention_dp 8 --ffn_ep 8 \
