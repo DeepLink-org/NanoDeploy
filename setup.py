@@ -8,7 +8,6 @@ URLs based on this file's location at build time, keeping the result portable
 across machines/checkout paths.
 """
 
-import os
 from pathlib import Path
 
 from setuptools import setup
