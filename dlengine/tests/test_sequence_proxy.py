@@ -1,14 +1,20 @@
-"""Sanity checks for C++ Sequence container proxies.
+"""Sanity checks for C++ Sequence Python bindings.
 
-This repo does not require pytest; run with:
+Run with:
   python tests/test_sequence_proxy.py
 
-It exits 0 on success (or if C++ extension is unavailable).
+It exits 0 on success, or when the C++ extension is unavailable.
 """
 
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
 
 
 def _skip(msg: str) -> int:
@@ -18,37 +24,29 @@ def _skip(msg: str) -> int:
 
 def main() -> int:
     try:
-        from dlengine._cpp import Sequence  # type: ignore
+        from dlengine._cpp import (
+            BlockContextSlot,
+            BlockLocation,
+            SamplingParams,
+            Sequence,
+        )
     except Exception as e:
         return _skip(f"dlengine._cpp not importable: {type(e).__name__}: {e}")
 
-    # C++ Sequence signature: (token_ids, temperature, max_tokens, ignore_eos, engine_id, master_sp_rank)
-    seq = Sequence([1, 2, 3], 1.0, 16, False, "engine", 0)
+    seq = Sequence([1, 2, 3], SamplingParams(1.0, 16, False, False))
+    seq.active("engine", 1, 1, 16)
 
-    ctx = seq.block_ctx("engine")
+    ctx = seq.block_ctx(BlockContextSlot.ACTIVE)
 
-    # 1) block_location is a mutable proxy (not a Python list copy)
-    ctx.block_location.clear()
-    ctx.block_location.append((0, 42))
+    ctx.block_location = [BlockLocation(0, 42)]
     assert len(ctx.block_location) == 1
-    assert tuple(ctx.block_location[0]) == (0, 42)
+    loc = ctx.block_location[0]
+    assert (loc.first, loc.second) == (0, 42)
 
-    # 2) group_block_table is a mutable proxy with defaultdict(list)-like semantics
-    ctx.group_block_table.clear()
-    ctx.group_block_table[0].append(7)
-    assert list(ctx.group_block_table[0]) == [7]
+    ctx.dp_idx = 123
+    assert seq.block_ctx(BlockContextSlot.ACTIVE).dp_idx == 123
 
-    # Also verify Sequence.block_table returns a mutable proxy into the same storage
-    table = seq.block_table("engine", 0)
-    table.append(9)
-    assert list(ctx.group_block_table[0]) == [7, 9]
-
-    # 3) block_ctx_map behaves like a mutable mapping proxy (no dict copy)
-    # This mirrors Python usage: seq.block_ctx_map[engine_id].dp_idx = selected_dp_idx
-    seq.block_ctx_map["engine"].dp_idx = 123
-    assert seq.block_ctx("engine").dp_idx == 123
-
-    print("[ok] C++ proxy containers behave as mutable views")
+    print("[ok] C++ Sequence bindings preserve assigned block context state")
     return 0
 
 

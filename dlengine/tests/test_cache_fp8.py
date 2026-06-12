@@ -1,14 +1,24 @@
 """Unit tests for CacheContext FP8 MLA allocation."""
 
-from unittest.mock import MagicMock, patch
+import sys
+import types
 
 import pytest
 import torch
+from conftest import require_cuda, require_dlengine_cpp
 
 # We need to mock distributed + dlslime since CacheContext.__post_init__ calls them.
 # Instead, we test allocate_kvcache directly.
 
-from dlengine.context.cache import _FP8_MLA_BYTES_PER_TOKEN, CacheContext
+require_dlengine_cpp()
+require_cuda()
+fake_dlslime = types.ModuleType("dlslime")
+fake_dlslime.available_nic = lambda: ["lo"]
+sys.modules.setdefault("dlslime", fake_dlslime)
+from dlengine.context.cache import CacheContext
+
+
+FP8_MLA_BYTES_PER_TOKEN = 656
 
 
 class TestCacheContextFP8:
@@ -39,7 +49,7 @@ class TestCacheContextFP8:
         ctx.ctrl_address = None
         ctx.ctrl_scope = None
         ctx.engine_id = None
-        ctx._fp8_head_dim = _FP8_MLA_BYTES_PER_TOKEN if is_fp8 else 0
+        ctx._fp8_head_dim = FP8_MLA_BYTES_PER_TOKEN if is_fp8 else 0
         return ctx
 
     def test_fp8_allocate_shape(self):
@@ -78,7 +88,7 @@ class TestCacheContextFP8:
         ctx_fp8.allocate_kvcache(100)
 
         bf16_bytes = ctx_bf16.kv_cache.nelement() * ctx_bf16.kv_cache.element_size()
-        fp8_bytes = ctx_fp8.kv_cache.storage().nbytes()
+        fp8_bytes = ctx_fp8.kv_cache.untyped_storage().nbytes()
 
         ratio = fp8_bytes / bf16_bytes
         # 656 / (576*2) = 0.569, but fp8 has +1 row padding so slightly more
@@ -105,7 +115,9 @@ class TestCacheContextFP8:
         """block_stride should return correct byte offset for FP8."""
         ctx = self._make_cache_context(is_fp8=True)
         stride = ctx.block_stride(1)
-        expected = 64 * 1 * 656 * 1  # block_size * kv_heads * fp8_head_dim * elem_size
+        expected = (
+            (64 + 1) * 1 * 656 * 1
+        )  # padded block_size * kv_heads * fp8_head_dim * elem_size
         assert stride == expected, f"block_stride(1) = {stride}, expected {expected}"
 
     def test_block_stride_bf16(self):

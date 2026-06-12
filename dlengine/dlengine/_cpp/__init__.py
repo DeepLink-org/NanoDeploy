@@ -41,6 +41,7 @@ def init_scheduler(config: Config) -> Scheduler:
         config.kvcache_block_size,
         config.mode,
     )
+    sched.routing_strategy = RoutingStrategy.__members__[config.routing_strategy]
 
     # DSv4: configure per-compression-ratio compressed-cache pools.
     # The compress_ratios attribute lives on the HF config; pools are sized

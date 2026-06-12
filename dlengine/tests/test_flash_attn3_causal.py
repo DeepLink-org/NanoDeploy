@@ -7,7 +7,11 @@ This is critical for chunked prefill where we process a chunk of Q tokens
 against the full KV context.
 """
 
+import pytest
 import torch
+
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def reference_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, causal, scale):
@@ -41,7 +45,10 @@ def reference_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, causal, scale):
 
 
 def test_flash_attn_varlen_causal_qk_mismatch():
-    from flash_attn_interface import flash_attn_varlen_func
+    flash_attn_interface = pytest.importorskip(
+        "flash_attn_interface", reason="flash_attn_interface is required"
+    )
+    flash_attn_varlen_func = flash_attn_interface.flash_attn_varlen_func
 
     torch.manual_seed(42)
     device = "cuda"
@@ -121,7 +128,10 @@ def test_flash_attn_varlen_causal_qk_mismatch():
 
 def test_flash_attn_varlen_causal_equal_lens():
     """Sanity check: when seqlen_q == seqlen_k, causal should be standard."""
-    from flash_attn_interface import flash_attn_varlen_func
+    flash_attn_interface = pytest.importorskip(
+        "flash_attn_interface", reason="flash_attn_interface is required"
+    )
+    flash_attn_varlen_func = flash_attn_interface.flash_attn_varlen_func
 
     torch.manual_seed(42)
     device = "cuda"

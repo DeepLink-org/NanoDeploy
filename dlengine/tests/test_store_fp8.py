@@ -2,6 +2,11 @@
 
 import pytest
 import torch
+from conftest import require_cuda, require_dlengine_cpp
+
+require_dlengine_cpp()
+require_cuda()
+pytest.importorskip("triton", reason="Triton is required for KV store kernels")
 from dlengine.kernel.triton.generic.kv_store import store_kcache
 from dlengine.kernel.triton.hopper.fp8_utils import (
     D_NOPE,
