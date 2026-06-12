@@ -2,6 +2,10 @@
 
 import pytest
 import torch
+from conftest import require_dlengine_cpp
+
+require_dlengine_cpp()
+pytest.importorskip("triton", reason="Triton is required for FP8 kernel utilities")
 from dlengine.kernel.triton.hopper.fp8_utils import (
     D_NOPE,
     D_ROPE,
@@ -17,6 +21,11 @@ from dlengine.kernel.triton.hopper.fp8_utils import (
     TILE_SIZE,
     unpack_mla_fp8,
 )
+
+
+def require_cuda_device():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for Triton store_kcache_fp8 tests")
 
 
 @pytest.fixture
@@ -135,6 +144,7 @@ class TestEndToEnd:
 
     def test_store_kcache_fp8(self, device):
         """store_kcache_fp8 writes to correct slots and data can be recovered."""
+        require_cuda_device()
         N = 10
         num_blocks = 4
         block_size = 64
@@ -174,6 +184,7 @@ class TestEndToEnd:
 
     def test_store_kcache_fp8_with_skip(self, device):
         """Slots with -1 should be skipped (no write)."""
+        require_cuda_device()
         N = 4
         num_blocks = 2
         block_size = 64
@@ -203,6 +214,7 @@ class TestEndToEnd:
 
     def test_store_kcache_fp8_shuffled_slots(self, device):
         """Out-of-order slot mapping should scatter correctly."""
+        require_cuda_device()
         N = 8
         num_blocks = 4
         block_size = 64

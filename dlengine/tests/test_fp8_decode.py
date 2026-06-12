@@ -1,8 +1,12 @@
 """Unit tests for FP8 KV cache → FlashMLA decode integration."""
 
-import flash_mla
 import pytest
 import torch
+from conftest import require_cuda, require_dlengine_cpp
+
+require_dlengine_cpp()
+require_cuda()
+flash_mla = pytest.importorskip("flash_mla", reason="flash_mla is required")
 from dlengine.kernel.triton.hopper.fp8_utils import (
     D_NOPE,
     D_TOTAL,

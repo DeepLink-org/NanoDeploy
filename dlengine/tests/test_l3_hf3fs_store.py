@@ -11,9 +11,15 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
 
 
 def _skip(msg: str) -> int:
@@ -146,8 +152,9 @@ def main() -> int:
         return _skip(f"{args.mountpoint} is not a 3FS mount")
     try:
         import hf3fs_fuse.io  # noqa: F401
+        import dlengine._cpp  # noqa: F401
     except Exception as e:
-        return _skip(f"hf3fs_fuse not importable: {e}")
+        return _skip(f"deps unavailable: {e}")
 
     for mode in ("dsv4", "gqa"):
         _run_mode(

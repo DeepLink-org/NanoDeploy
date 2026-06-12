@@ -50,13 +50,21 @@ def get_device_props(device=None):
 
 
 def is_cuda():
-    return triton.runtime.driver.active.get_current_target().backend == "cuda"
+    try:
+        return triton.runtime.driver.active.get_current_target().backend == "cuda"
+    except RuntimeError:
+        return False
 
 
 @functools.lru_cache
 def supports_tma():
-    ret = is_cuda() and torch.cuda.get_device_capability()[0] >= 9
-    if not ret:
+    if not is_cuda():
+        return False
+
+    try:
+        if torch.cuda.get_device_capability()[0] < 9:
+            return False
+    except RuntimeError:
         return False
 
     VALID_VERSION = version.parse("3.4.0")

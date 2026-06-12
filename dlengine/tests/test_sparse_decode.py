@@ -8,6 +8,15 @@ Tests:
 
 import pytest
 import torch
+from conftest import require_cuda, require_dlengine_cpp
+
+require_cuda()
+require_dlengine_cpp()
+pytest.importorskip("deep_gemm", reason="deep_gemm is required for Indexer tests")
+pytest.importorskip(
+    "fast_hadamard_transform",
+    reason="fast_hadamard_transform is required for Indexer tests",
+)
 
 # V3.2 config constants
 HIDDEN_SIZE = 7168
